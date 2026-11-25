@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="104" height="72" viewBox="0 0 104 72" role="img" aria-label="Tori">
+  <style>
+    .f { fill: #1f1f28; }
+    .s { fill: none; stroke: #1f1f28; stroke-width: 7; stroke-linecap: round; }
+    @media (prefers-color-scheme: dark) { .f { fill: #ececf2; } .s { stroke: #ececf2; } }
+  </style>
+  <!-- T as a torii gate -->
+  <path class="f" d="M1 9 Q24 15 47 9 L45 18 Q24 22 3 18 Z"/>
+  <rect class="f" x="12" y="26" width="24" height="4" rx="2"/>
+  <rect class="f" x="20.5" y="18" width="7" height="42" rx="2"/>
+  <!-- o -->
+  <circle class="s" cx="47.5" cy="46" r="10.5"/>
+  <!-- r -->
+  <rect class="f" x="67.5" y="32" width="7" height="28" rx="2"/>
+  <path class="s" d="M71 45 Q72 35.5 83 35.5"/>
+  <!-- i -->
+  <rect class="f" x="92.5" y="32" width="7" height="28" rx="2"/>
+  <circle class="f" cx="96" cy="23" r="4"/>
+</svg>
