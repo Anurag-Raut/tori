@@ -301,7 +301,7 @@ func DefaultNameOf(n int, m store.Meta) string {
 // DefaultLabel formats "<name> [alias] · <plan>".
 func DefaultLabel(name string, m store.Meta) string {
 	bits := []string{name}
-	if m.Alias != "" {
+	if m.Alias != "" && !strings.EqualFold(m.Alias, name) {
 		bits = append(bits, fmt.Sprintf("[%s]", m.Alias))
 	}
 	if m.Plan != "" && m.Plan != "API key" {
@@ -526,7 +526,7 @@ func Entries(env *Env, p Provider, network, force bool) ([]AccountEntry, *int, e
 	for _, s := range accts {
 		name := p.NameOf(s.Number, s.Meta)
 		var aliasPtr *string
-		if s.Meta.Alias != "" && s.Meta.Alias != name {
+		if s.Meta.Alias != "" && !strings.EqualFold(s.Meta.Alias, name) {
 			a := s.Meta.Alias
 			aliasPtr = &a
 		}

@@ -427,3 +427,14 @@ func TestOrderedProvidersEmptyLast(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultLabelDeduplicatesAliasMatchingName(t *testing.T) {
+	got := DefaultLabel("user@example.com", store.Meta{Email: "user@example.com", Alias: "User@Example.com", Plan: "Pro"})
+	if got != "user@example.com · Pro" {
+		t.Fatalf("DefaultLabel duplicated alias: got %q", got)
+	}
+	got2 := DefaultLabel("user@example.com", store.Meta{Email: "user@example.com", Alias: "Work", Plan: "Pro"})
+	if got2 != "user@example.com [Work] · Pro" {
+		t.Fatalf("DefaultLabel dropped distinct alias: got %q", got2)
+	}
+}
