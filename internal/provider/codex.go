@@ -276,6 +276,7 @@ func (x *Codex) Add(env *Env, args []string) ([]string, error) {
 				if err := x.saveSlot(s.Dir, live, &s.Meta); err != nil {
 					return nil, err
 				}
+				ClearUsageCooldown(s.Dir)
 				return []string{fmt.Sprintf("Updated slot %d: %s", s.Number, x.Label(s.Number, s.Meta))}, nil
 			}
 		}

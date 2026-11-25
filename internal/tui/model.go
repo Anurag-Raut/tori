@@ -57,6 +57,7 @@ type usageResult struct {
 type usageLoadedMsg struct {
 	results []usageResult
 	note    string
+	forced  bool
 }
 
 type actionDoneMsg struct {
@@ -252,7 +253,7 @@ func fetchUsageCmd(env *provider.Env, providers []provider.Provider, force bool,
 			}
 		}
 		if len(targets) == 0 {
-			return usageLoadedMsg{note: note}
+			return usageLoadedMsg{note: note, forced: force}
 		}
 		results := make([]usageResult, len(targets))
 		var wg sync.WaitGroup
@@ -269,7 +270,7 @@ func fetchUsageCmd(env *provider.Env, providers []provider.Provider, force bool,
 			}(i, p)
 		}
 		wg.Wait()
-		return usageLoadedMsg{results: results, note: note}
+		return usageLoadedMsg{results: results, note: note, forced: force}
 	}
 }
 
@@ -460,6 +461,57 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.note != "" {
 			m.statusMsg = msg.note
 			m.statusTone = toneGreen
+		} else if msg.forced {
+			total, throttled, errThrottled, rateLimited := 0, 0, 0, 0
+			minWait, maxErrWait := 0, 0
+			for _, res := range msg.results {
+				for _, a := range res.accounts {
+					if a.Usage == nil {
+						continue
+					}
+					total++
+					if a.Usage.Throttled {
+						throttled++
+						w := 0
+						if a.Usage.RetryAfterSeconds != nil {
+							w = *a.Usage.RetryAfterSeconds
+						}
+						if w > 0 && (minWait == 0 || w < minWait) {
+							minWait = w
+						}
+						if a.Usage.Error != nil && *a.Usage.Error != "" {
+							errThrottled++
+							if *a.Usage.Error == "rate limited" {
+								rateLimited++
+							}
+							if w > maxErrWait {
+								maxErrWait = w
+							}
+						}
+					}
+				}
+			}
+			switch {
+			case total > 0 && throttled == total && errThrottled > 0:
+				wait := maxErrWait
+				if wait == 0 {
+					wait = minWait
+				}
+				if rateLimited == errThrottled {
+					m.statusMsg = fmt.Sprintf("Rate limited — retry in %s", provider.FmtWait(wait))
+				} else {
+					m.statusMsg = fmt.Sprintf("Usage on cooldown — retry in %s", provider.FmtWait(wait))
+				}
+				m.statusTone = toneYellow
+			case total > 0 && throttled == total:
+				m.statusMsg = fmt.Sprintf("Usage refreshed recently — retry in %s", provider.FmtWait(minWait))
+				m.statusTone = toneYellow
+			case throttled > 0:
+				m.statusMsg = "Refreshed (some accounts on cooldown)"
+				m.statusTone = toneYellow
+			case strings.HasPrefix(m.statusMsg, "Reading") || strings.HasPrefix(m.statusMsg, "Refreshing"):
+				m.statusMsg = ""
+			}
 		} else if strings.HasPrefix(m.statusMsg, "Reading") || strings.HasPrefix(m.statusMsg, "Refreshing") {
 			m.statusMsg = ""
 		}
@@ -868,6 +920,11 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statusTone = toneYellow
 			return m, nil
 		}
+		if m.loading {
+			m.statusMsg = "Usage refresh already in progress..."
+			m.statusTone = toneYellow
+			return m, nil
+		}
 		m.loading = true
 		m.statusMsg = "Refreshing usage..."
 		m.statusTone = toneYellow
@@ -1119,10 +1176,14 @@ func (m Model) renderFooter() ([]string, []hitRect) {
 	x := 1
 	rowIdx := 0
 	for _, item := range footerKeys {
-		hovered := item.actionKey != "" && item.actionKey == m.hoverFooter
+		busyRefresh := m.loading && item.actionKey == "r"
+		hovered := !busyRefresh && item.actionKey != "" && item.actionKey == m.hoverFooter
 		capStyle := m.styles.keycap
 		labStyle := m.styles.muted
-		if hovered {
+		if busyRefresh {
+			capStyle = m.styles.dim
+			labStyle = m.styles.dim
+		} else if hovered {
 			capStyle = m.styles.keycapHover
 			labStyle = m.styles.bold
 		}
@@ -1233,10 +1294,14 @@ func (m Model) renderUsageSegments(u *provider.UsageInfo, bw int, withReset bool
 	}
 	if u.Error != nil && *u.Error != "" {
 		errText := *u.Error
+		displayErr := errText
+		if u.RetryAfterSeconds != nil && *u.RetryAfterSeconds > 0 {
+			displayErr += " · retry " + provider.FmtWait(*u.RetryAfterSeconds)
+		}
 		if strings.Contains(errText, "expired") || strings.Contains(errText, "offline") {
-			parts = append(parts, m.styles.red.Render(errText))
+			parts = append(parts, m.styles.red.Render(displayErr))
 		} else {
-			parts = append(parts, m.styles.muted.Render(errText))
+			parts = append(parts, m.styles.muted.Render(displayErr))
 		}
 	} else if stale && u.AgeSeconds != nil {
 		parts = append(parts, m.styles.muted.Render(provider.FmtAge(*u.AgeSeconds)))

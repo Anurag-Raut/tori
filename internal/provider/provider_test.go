@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -528,5 +529,280 @@ func TestClearLiveAndRestoreAllProviders(t *testing.T) {
 	}
 	if st, _ := g.Status(env); !st.LoggedIn || st.ManagedSlot == nil || *st.ManagedSlot != 1 {
 		t.Fatalf("expected antigravity restored to slot 1, got %+v", st)
+	}
+}
+
+func seedCodexForUsageTest(t *testing.T, env *Env) (*Codex, store.Slot) {
+	t.Helper()
+	x := &Codex{}
+	_ = store.WriteJSONAtomic(filepath.Join(env.Home, ".codex", "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"access_token":  "at-codex-rl",
+			"refresh_token": "rt-codex-rl",
+			"account_id":    "acct-rl-1",
+			"id_token": makeJWT(map[string]any{
+				"email": "rl@example.com",
+				"https://api.openai.com/auth": map[string]any{
+					"chatgpt_account_id": "acct-rl-1",
+					"chatgpt_plan_type":  "plus",
+				},
+			}),
+		},
+	}, 0o600, false)
+	if _, err := x.Add(env, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SetUsage(env.Root, []string{"codex"}, true); err != nil {
+		t.Fatal(err)
+	}
+	slots, err := x.Slots(env)
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("expected 1 codex slot, got %v %v", slots, err)
+	}
+	return x, slots[0]
+}
+
+func TestUsageManualRefreshCooldown(t *testing.T) {
+	var calls atomic.Int32
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return jsonResponse(200, map[string]any{
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{"used_percent": 20.0},
+			},
+		}), nil
+	})
+	env, _ := newTestEnv(t, rt)
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	env.Now = func() time.Time { return now }
+	x, slot := seedCodexForUsageTest(t, env)
+
+	// First fetch hits the network.
+	info := UsageForSlot(env, x, slot, true, nil, true, true)
+	if info == nil || info.Throttled || calls.Load() != 1 {
+		t.Fatalf("expected 1 fresh fetch, got info=%+v calls=%d", info, calls.Load())
+	}
+
+	// Immediate manual retry (force=true) is throttled by UsageMinRefresh.
+	now = now.Add(5 * time.Second)
+	info = UsageForSlot(env, x, slot, true, nil, true, true)
+	if info == nil || !info.Throttled || info.RetryAfterSeconds == nil || *info.RetryAfterSeconds < 20 {
+		t.Fatalf("expected manual refresh cooldown, got %+v", info)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected 0 extra HTTP calls during cooldown, got %d", calls.Load())
+	}
+
+	// Advancing past UsageMinRefresh allows another manual refresh.
+	now = now.Add(config.UsageMinRefresh)
+	info = UsageForSlot(env, x, slot, true, nil, true, true)
+	if info == nil || info.Throttled || calls.Load() != 2 {
+		t.Fatalf("expected 2nd fetch after cooldown, got info=%+v calls=%d", info, calls.Load())
+	}
+}
+
+func TestUsageRateLimitBackoffAndRetryAfter(t *testing.T) {
+	var calls atomic.Int32
+	var mode atomic.Int32 // 0=200(40%), 1=429(Retry-After:120), 2=429(no header), 3=200(55%)
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		switch mode.Load() {
+		case 0:
+			return jsonResponse(200, map[string]any{
+				"rate_limit": map[string]any{
+					"primary_window": map[string]any{"used_percent": 40.0},
+				},
+			}), nil
+		case 1:
+			resp := jsonResponse(429, map[string]any{"error": "rate_limited"})
+			resp.Header.Set("Retry-After", "120")
+			return resp, nil
+		case 2:
+			return jsonResponse(429, map[string]any{"error": "rate_limited"}), nil
+		default:
+			return jsonResponse(200, map[string]any{
+				"rate_limit": map[string]any{
+					"primary_window": map[string]any{"used_percent": 55.0},
+				},
+			}), nil
+		}
+	})
+	env, _ := newTestEnv(t, rt)
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	env.Now = func() time.Time { return now }
+	x, slot := seedCodexForUsageTest(t, env)
+
+	// Initial success caches 40%.
+	info := UsageForSlot(env, x, slot, true, nil, true, false)
+	if info == nil || len(info.Windows) != 1 || info.Windows[0].Pct != 40.0 {
+		t.Fatalf("expected initial 40%% window, got %+v", info)
+	}
+
+	// Expire cache and return HTTP 429 with Retry-After: 120.
+	now = now.Add(config.UsageTTL + 10*time.Second)
+	mode.Store(1)
+	info = UsageForSlot(env, x, slot, true, nil, true, false)
+	if info == nil || !info.Throttled || len(info.Windows) != 1 || info.Windows[0].Pct != 40.0 {
+		t.Fatalf("expected cached 40%% window preserved on 429, got %+v", info)
+	}
+	if info.RetryAfterSeconds == nil || *info.RetryAfterSeconds != 120 {
+		t.Fatalf("expected RetryAfterSeconds=120 from Retry-After header, got %+v", info.RetryAfterSeconds)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 total HTTP calls, got %d", calls.Load())
+	}
+
+	// Repeated force retries during the 120s cooldown must make ZERO HTTP calls.
+	now = now.Add(30 * time.Second)
+	for i := 0; i < 3; i++ {
+		info = UsageForSlot(env, x, slot, true, nil, true, true)
+		if info == nil || !info.Throttled || info.RetryAfterSeconds == nil || *info.RetryAfterSeconds != 90 {
+			t.Fatalf("retry %d: expected throttled with 90s remaining, got %+v", i, info)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 0 HTTP calls during 429 cooldown, got %d total", calls.Load())
+	}
+
+	// Advance past 120s; second 429 (no Retry-After header) triggers 2x exponential backoff (120s).
+	now = now.Add(95 * time.Second)
+	mode.Store(2)
+	info = UsageForSlot(env, x, slot, true, nil, true, true)
+	if calls.Load() != 3 {
+		t.Fatalf("expected 3rd HTTP call after cooldown elapsed, got %d", calls.Load())
+	}
+	if info == nil || !info.Throttled || info.RetryAfterSeconds == nil || *info.RetryAfterSeconds != 120 {
+		t.Fatalf("expected 2x exponential backoff (120s) on 2nd 429, got %+v", info)
+	}
+
+	// Advance past backoff; 200 clears FailCount and CooldownUntil.
+	now = now.Add(125 * time.Second)
+	mode.Store(3)
+	info = UsageForSlot(env, x, slot, true, nil, true, true)
+	if calls.Load() != 4 || info == nil || info.Throttled || info.RetryAfterSeconds != nil || info.Windows[0].Pct != 55.0 {
+		t.Fatalf("expected clean recovery to 55%%, got info=%+v calls=%d", info, calls.Load())
+	}
+	var disk UsageCache
+	if !store.ReadJSON(filepath.Join(slot.Dir, "usage.json"), &disk) || disk.FailCount != 0 || disk.CooldownUntil != 0 {
+		t.Fatalf("expected persisted backoff cleared after success, got %+v", disk)
+	}
+}
+
+func TestUsageTransientErrorExponentialBackoff(t *testing.T) {
+	var calls atomic.Int32
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return jsonResponse(503, map[string]any{"error": "unavailable"}), nil
+	})
+	env, _ := newTestEnv(t, rt)
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	env.Now = func() time.Time { return now }
+	x, slot := seedCodexForUsageTest(t, env)
+
+	// 1st 503 -> 30s backoff.
+	info := UsageForSlot(env, x, slot, true, nil, true, true)
+	if calls.Load() != 1 || info == nil || info.RetryAfterSeconds == nil || *info.RetryAfterSeconds != 30 {
+		t.Fatalf("expected 30s backoff on 1st 503, got info=%+v calls=%d", info, calls.Load())
+	}
+	// Retry at +10s -> blocked.
+	now = now.Add(10 * time.Second)
+	info = UsageForSlot(env, x, slot, true, nil, true, true)
+	if calls.Load() != 1 || !info.Throttled {
+		t.Fatalf("expected blocked during 1st backoff, got info=%+v calls=%d", info, calls.Load())
+	}
+
+	// 2nd 503 at +31s -> 60s backoff.
+	now = now.Add(21 * time.Second)
+	info = UsageForSlot(env, x, slot, true, nil, true, true)
+	if calls.Load() != 2 || info.RetryAfterSeconds == nil || *info.RetryAfterSeconds != 60 {
+		t.Fatalf("expected 60s backoff on 2nd 503, got info=%+v calls=%d", info, calls.Load())
+	}
+
+	// 3rd 503 after +61s -> 120s backoff.
+	now = now.Add(61 * time.Second)
+	info = UsageForSlot(env, x, slot, true, nil, true, true)
+	if calls.Load() != 3 || info.RetryAfterSeconds == nil || *info.RetryAfterSeconds != 120 {
+		t.Fatalf("expected 120s backoff on 3rd 503, got info=%+v calls=%d", info, calls.Load())
+	}
+}
+
+func TestUsageSingleflightCoalescesConcurrentFetches(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		return jsonResponse(200, map[string]any{
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{"used_percent": 25.0},
+			},
+		}), nil
+	})
+	env, _ := newTestEnv(t, rt)
+	x, slot := seedCodexForUsageTest(t, env)
+
+	const workers = 5
+	results := make([]*UsageInfo, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			results[idx] = UsageForSlot(env, x, slot, true, nil, true, true)
+		}(i)
+	}
+	<-started
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if calls.Load() != 1 {
+		t.Fatalf("expected 5 concurrent callers to coalesce into 1 HTTP call, got %d", calls.Load())
+	}
+	for i, res := range results {
+		if res == nil || len(res.Windows) != 1 || res.Windows[0].Pct != 25.0 {
+			t.Fatalf("worker %d: unexpected result %+v", i, res)
+		}
+	}
+}
+
+func TestClearUsageCooldownOnReAdd(t *testing.T) {
+	var calls atomic.Int32
+	var okStatus atomic.Bool
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		if !okStatus.Load() {
+			return jsonResponse(401, map[string]any{"error": "unauthorized"}), nil
+		}
+		return jsonResponse(200, map[string]any{
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{"used_percent": 15.0},
+			},
+		}), nil
+	})
+	env, _ := newTestEnv(t, rt)
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	env.Now = func() time.Time { return now }
+	x, slot := seedCodexForUsageTest(t, env)
+
+	// 401 sets UsageAuthErrorCooldown (60s).
+	info := UsageForSlot(env, x, slot, true, nil, true, true)
+	if info == nil || info.Error == nil || *info.Error != "login expired" || calls.Load() != 1 {
+		t.Fatalf("expected login expired on 401, got info=%+v calls=%d", info, calls.Load())
+	}
+
+	// Re-adding (updating credentials) clears the auth error cooldown immediately.
+	okStatus.Store(true)
+	if _, err := x.Add(env, nil); err != nil {
+		t.Fatal(err)
+	}
+	info = UsageForSlot(env, x, slot, true, nil, true, true)
+	if calls.Load() != 2 || info == nil || info.Error != nil || len(info.Windows) != 1 || info.Windows[0].Pct != 15.0 {
+		t.Fatalf("expected immediate fetch after credential update, got info=%+v calls=%d", info, calls.Load())
 	}
 }

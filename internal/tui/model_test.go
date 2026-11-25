@@ -680,3 +680,68 @@ func TestTUIProviderIconsAndAddModalLeftRightTabSwitch(t *testing.T) {
 		t.Fatalf("expected clicking Antigravity tab to switch provider, got %s", m.modalProvider.Key())
 	}
 }
+
+func TestTUIRefreshCoalescesInFlightAndShowsCooldownNotice(t *testing.T) {
+	var calls atomic.Int32
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		body := `{"rate_limit":{"primary_window":{"used_percent":22.0}}}`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+	env, _ := setupTUIEnv(t, rt)
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	env.Now = func() time.Time { return now }
+
+	writeCodexSlot(t, env, "acct-tui-rl", "alex@acme.dev", true)
+	if err := config.SetUsage(env.Root, []string{"codex"}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewModel(env)
+
+	// Press 'r' -> starts refresh, sets m.loading = true.
+	next, cmd := m.Update(keyRune('r'))
+	m = next.(Model)
+	if !m.loading || cmd == nil {
+		t.Fatalf("expected refresh to start loading with non-nil cmd, got loading=%v cmd=%v", m.loading, cmd)
+	}
+
+	// Pressing 'r' again while already loading must NOT start a second fetch.
+	next, dupCmd := m.Update(keyRune('r'))
+	m = next.(Model)
+	if dupCmd != nil {
+		t.Fatal("expected duplicate 'r' while loading to return nil cmd")
+	}
+	if !strings.Contains(m.statusMsg, "already in progress") {
+		t.Fatalf("expected in-progress status notice, got %q", m.statusMsg)
+	}
+
+	// Deliver the usageLoadedMsg from the first fetch.
+	msg := fetchUsageCmd(m.env, m.providers, true, "", "")()
+	next, _ = m.Update(msg)
+	m = next.(Model)
+	if m.loading {
+		t.Fatal("expected loading=false after usageLoadedMsg")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected 1 HTTP call, got %d", calls.Load())
+	}
+
+	// Press 'r' again 5 seconds later -> throttled by UsageMinRefresh; 0 extra HTTP calls & clear notice.
+	now = now.Add(5 * time.Second)
+	next, _ = m.Update(keyRune('r'))
+	m = next.(Model)
+	msg2 := fetchUsageCmd(m.env, m.providers, true, "", "")()
+	next, _ = m.Update(msg2)
+	m = next.(Model)
+	if calls.Load() != 1 {
+		t.Fatalf("expected 0 extra HTTP calls during manual refresh cooldown, got %d", calls.Load())
+	}
+	if !strings.Contains(m.statusMsg, "retry in") {
+		t.Fatalf("expected cooldown notice with retry wait, got %q", m.statusMsg)
+	}
+}
