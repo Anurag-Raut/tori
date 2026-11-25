@@ -12,22 +12,16 @@ const (
 	// UsageTTL is the cache lifetime before a usage reading is fetched again.
 	UsageTTL = 180 * time.Second
 
-	DisclaimerHead = "Usage meters are off by default. When on, tori reads each saved account's usage by " +
-		"calling the provider's own usage endpoint with that account's saved login, from " +
-		"outside the official app. For accounts you aren't using, it may also refresh their " +
-		"saved access token. Nothing goes anywhere else."
-	DisclaimerTerms = "Each provider's terms govern your accounts:"
-	DisclaimerTail  = "Turn this on only if you accept that risk. You can turn it off any time."
+	DisclaimerHead = "Reads quota directly from the provider using your saved logins (may refresh expired tokens). Nothing is sent anywhere else."
+	DisclaimerTail = "You can turn this off any time."
 )
 
 // ToolKeys lists the canonical provider keys in display order.
 var ToolKeys = []string{"claude", "codex", "antigravity"}
 
-// DisclaimerTool maps provider keys to their provider-specific terms warning.
+// DisclaimerTool maps provider keys with notable terms risks to a short warning.
 var DisclaimerTool = map[string]string{
-	"claude":      "Claude: Anthropic limits subscription sign-in to Claude Code and its own apps.",
-	"codex":       "Codex: OpenAI's terms prohibit circumventing rate limits.",
-	"antigravity": "Antigravity: Google's terms say using third-party tools to access the service with Antigravity sign-in is a breach and may lead to suspension.",
+	"antigravity": "Antigravity: Google's terms prohibit third-party tools using Antigravity sign-in and may lead to account suspension.",
 }
 
 // Config represents ~/.tori/config.json.
@@ -100,13 +94,13 @@ func SetUsage(root string, keys []string, enabled bool) error {
 	return store.WriteJSONAtomic(Path(root), raw, 0o600, false)
 }
 
-// DisclaimerLines returns the opt-in text for the given tool keys as paragraphs/bullets.
+// DisclaimerLines returns concise opt-in text for the given tool keys.
 func DisclaimerLines(keys []string) []string {
-	lines := make([]string, 0, len(keys)+3)
-	lines = append(lines, DisclaimerHead, DisclaimerTerms)
+	lines := make([]string, 0, len(keys)+2)
+	lines = append(lines, DisclaimerHead)
 	for _, k := range keys {
 		if text, ok := DisclaimerTool[k]; ok {
-			lines = append(lines, "- "+text)
+			lines = append(lines, "Warning: "+text)
 		}
 	}
 	lines = append(lines, DisclaimerTail)

@@ -438,3 +438,95 @@ func TestDefaultLabelDeduplicatesAliasMatchingName(t *testing.T) {
 		t.Fatalf("DefaultLabel dropped distinct alias: got %q", got2)
 	}
 }
+
+func TestClearLiveAndRestoreAllProviders(t *testing.T) {
+	env, envMap := newTestEnv(t, nil)
+
+	// --- Claude Code: preserves non-auth keys in both files ---
+	c := &Claude{}
+	credsPath := filepath.Join(env.Home, ".claude", ".credentials.json")
+	cfgPath := filepath.Join(env.Home, ".claude.json")
+	_ = store.WriteJSONAtomic(credsPath, map[string]any{
+		"claudeAiOauth": map[string]any{"accessToken": "at-1", "refreshToken": "rt-1", "subscriptionType": "pro"},
+		"mcpOAuth":      map[string]any{"keep": true},
+	}, 0o600, false)
+	_ = store.WriteJSONAtomic(cfgPath, map[string]any{
+		"oauthAccount": map[string]any{"accountUuid": "uuid-1", "emailAddress": "dev@example.com"},
+		"theme":        "dark",
+	}, 0o600, false)
+	if _, err := c.Add(env, nil); err != nil {
+		t.Fatal(err)
+	}
+	restoreC, err := c.ClearLive(env)
+	if err != nil {
+		t.Fatalf("claude ClearLive failed: %v", err)
+	}
+	st, _ := c.Status(env)
+	if st.LoggedIn {
+		t.Fatal("expected claude logged out after ClearLive")
+	}
+	if m := store.ReadJSONMap(credsPath); m["mcpOAuth"] == nil {
+		t.Fatal("expected mcpOAuth preserved in .credentials.json")
+	}
+	if m := store.ReadJSONMap(cfgPath); m["theme"] != "dark" {
+		t.Fatal("expected theme preserved in .claude.json")
+	}
+	if err := restoreC(); err != nil {
+		t.Fatalf("claude restore failed: %v", err)
+	}
+	st, _ = c.Status(env)
+	if !st.LoggedIn || st.DisplayName != "dev@example.com" {
+		t.Fatalf("expected claude login restored, got %+v", st)
+	}
+
+	// --- Codex ---
+	x := &Codex{}
+	codexAuth := filepath.Join(env.Home, ".codex", "auth.json")
+	_ = store.WriteJSONAtomic(codexAuth, map[string]any{
+		"auth_mode": "chatgpt",
+		"tokens": map[string]any{
+			"account_id":    "acct-x1",
+			"access_token":  "at-x1",
+			"refresh_token": "rt-x1",
+			"id_token":      makeJWT(map[string]any{"email": "codex@example.com"}),
+		},
+	}, 0o600, false)
+	if _, err := x.Add(env, nil); err != nil {
+		t.Fatal(err)
+	}
+	restoreX, err := x.ClearLive(env)
+	if err != nil {
+		t.Fatalf("codex ClearLive failed: %v", err)
+	}
+	if st, _ := x.Status(env); st.LoggedIn {
+		t.Fatal("expected codex logged out after ClearLive")
+	}
+	if err := restoreX(); err != nil {
+		t.Fatalf("codex restore failed: %v", err)
+	}
+	if st, _ := x.Status(env); !st.LoggedIn || st.DisplayName != "codex@example.com" {
+		t.Fatalf("expected codex restored, got %+v", st)
+	}
+
+	// --- Antigravity ---
+	g := &Antigravity{}
+	agyPath := filepath.Join(env.Home, "agy", "acp_token.json")
+	envMap["TORI_AGY_TOKEN"] = agyPath
+	_ = store.WriteJSONAtomic(agyPath, map[string]any{"refresh_token": "rt-g1"}, 0o600, false)
+	if _, err := g.Add(env, []string{"main"}); err != nil {
+		t.Fatal(err)
+	}
+	restoreG, err := g.ClearLive(env)
+	if err != nil {
+		t.Fatalf("antigravity ClearLive failed: %v", err)
+	}
+	if st, _ := g.Status(env); st.LoggedIn {
+		t.Fatal("expected antigravity logged out after ClearLive")
+	}
+	if err := restoreG(); err != nil {
+		t.Fatalf("antigravity restore failed: %v", err)
+	}
+	if st, _ := g.Status(env); !st.LoggedIn || st.ManagedSlot == nil || *st.ManagedSlot != 1 {
+		t.Fatalf("expected antigravity restored to slot 1, got %+v", st)
+	}
+}

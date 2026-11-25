@@ -280,9 +280,12 @@ func cmdUsage(env *provider.Env, rest []string, ioCfg IO) int {
 	}
 	dl := config.DisclaimerLines(todoKeys)
 	if len(dl) >= 2 {
-		fmt.Fprintln(ioCfg.Stdout, dl[0]+"\n")
-		for _, mid := range dl[1 : len(dl)-1] {
-			fmt.Fprintln(ioCfg.Stdout, mid)
+		fmt.Fprintln(ioCfg.Stdout, dl[0])
+		if len(dl) > 2 {
+			fmt.Fprintln(ioCfg.Stdout)
+			for _, mid := range dl[1 : len(dl)-1] {
+				fmt.Fprintln(ioCfg.Stdout, mid)
+			}
 		}
 		fmt.Fprintln(ioCfg.Stdout, "\n"+dl[len(dl)-1])
 		fmt.Fprintln(ioCfg.Stdout)

@@ -43,19 +43,23 @@ func TestUsageDefaultsAndSetUsage(t *testing.T) {
 }
 
 func TestDisclaimerLines(t *testing.T) {
+	// Claude-only stays short with no provider-specific warning.
+	claudeLines := DisclaimerLines([]string{"claude"})
+	if len(claudeLines) != 2 {
+		t.Fatalf("expected 2 lines for claude, got %d: %v", len(claudeLines), claudeLines)
+	}
+	if claudeLines[0] != DisclaimerHead || claudeLines[1] != DisclaimerTail {
+		t.Fatalf("unexpected claude disclaimer lines: %v", claudeLines)
+	}
+
+	// Antigravity includes Google's terms warning.
 	lines := DisclaimerLines([]string{"claude", "antigravity"})
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, DisclaimerHead) {
 		t.Fatal("missing DisclaimerHead")
 	}
-	if !strings.Contains(joined, DisclaimerTool["claude"]) {
-		t.Fatal("missing claude disclaimer")
-	}
 	if !strings.Contains(joined, DisclaimerTool["antigravity"]) {
 		t.Fatal("missing antigravity disclaimer")
-	}
-	if strings.Contains(joined, DisclaimerTool["codex"]) {
-		t.Fatal("unexpected codex disclaimer")
 	}
 	if !strings.Contains(joined, DisclaimerTail) {
 		t.Fatal("missing DisclaimerTail")

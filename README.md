@@ -62,12 +62,12 @@ Run `tori` with no arguments to open the interactive Bubble Tea picker (supports
 | Key / Mouse | Action |
 |---|---|
 | `↑` `↓` / `j` `k` / scroll wheel | Move selection |
-| Click / Double-click | Select row / Switch to account |
+| Hover / Click / Double-click | Hover rows, footer pills, and modal buttons; click buttons or footer shortcuts; double-click row to switch |
 | `Enter` | Switch to the selected account (or add on an empty tool) |
 | `Tab` | Jump to the next tool |
-| `a` | Save the signed-in login of the selected tool (asks for an optional alias; works on an empty tool) |
+| `a` | Guided add for all 3 tools (saves a new signed-in account right away, or guides you to log out & sign in to the next account and re-check) |
 | `b` | Rotate every tool with 2 or more saved accounts |
-| `d` / `Delete` | Remove the selected saved account (asks y/N, renumbers remaining slots) |
+| `d` / `Delete` | Guided remove (for active slots, offers one-key switch-and-remove or clear local login; renumbers remaining slots) |
 | `u` | Turn usage meters on or off for the selected tool (shows a disclaimer modal before turning on) |
 | `r` | Force-refresh usage (tools with meters on) |
 | `q` / `Esc` / `Ctrl+C` | Quit (or close active modal first on `Esc`) |
@@ -108,13 +108,9 @@ Tori sits beside Claude Code, Codex and Antigravity, not between them and the pr
 
 ## Terms of use
 
-Each provider's terms govern your accounts, and none of them names a local switcher like this. Usage meters are off by default because of this: when on, Tori reads each saved account's usage by calling the provider's own usage endpoint with that account's saved login, from outside the official app, and may refresh the saved access token of accounts you aren't using. Nothing goes anywhere else.
+Usage meters are off by default. When on, Tori reads quota directly from each provider using your saved logins (and may refresh expired tokens). Nothing is sent anywhere else, and you can turn meters off any time.
 
-- Claude: Anthropic limits subscription sign-in to Claude Code and its own apps.
-- Codex: OpenAI's terms prohibit circumventing rate limits.
-- Antigravity: Google's terms say using third-party tools to access the service with Antigravity sign-in is a breach and may lead to suspension.
-
-Turn meters on only if you accept that risk, and use only accounts you own. You can turn them off any time.
+- **Antigravity**: Google's terms prohibit third-party tools using Antigravity sign-in and may lead to account suspension. Turn Antigravity meters on only if you accept that risk.
 
 ## Privacy
 

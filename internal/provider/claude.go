@@ -168,6 +168,48 @@ func (c *Claude) refreshCurrentSnapshot(env *Env, accts []store.Slot) {
 	}
 }
 
+// ClearLive stashes any active slot snapshot and clears only local login keys
+// without revoking server-side OAuth tokens. The returned restore func undoes it.
+func (c *Claude) ClearLive(env *Env) (func() error, error) {
+	accts, _ := c.Slots(env)
+	c.refreshCurrentSnapshot(env, accts)
+
+	oauth, account := c.readLive(env)
+	if oauth == nil && account == nil {
+		return nil, nil
+	}
+	credsPath, cfgPath := c.livePaths(env)
+
+	if creds := store.ReadJSONMap(credsPath); creds != nil {
+		delete(creds, "claudeAiOauth")
+		if err := store.WriteJSONAtomic(credsPath, creds, 0o600, false); err != nil {
+			return nil, err
+		}
+	}
+	if cfg := store.ReadJSONMap(cfgPath); cfg != nil {
+		delete(cfg, "oauthAccount")
+		if err := store.WriteJSONAtomic(cfgPath, cfg, 0o600, true); err != nil {
+			return nil, err
+		}
+	}
+
+	restore := func() error {
+		if oauth != nil {
+			return c.applyLive(env, oauth, account)
+		}
+		if len(account) > 0 {
+			cfg := store.ReadJSONMap(cfgPath)
+			if cfg == nil {
+				cfg = make(map[string]any)
+			}
+			cfg["oauthAccount"] = account
+			return store.WriteJSONAtomic(cfgPath, cfg, 0o600, true)
+		}
+		return nil
+	}
+	return restore, nil
+}
+
 func (c *Claude) Status(env *Env) (StatusInfo, error) {
 	oauth, account := c.readLive(env)
 	if oauth == nil {

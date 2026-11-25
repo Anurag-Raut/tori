@@ -201,6 +201,29 @@ func (x *Codex) refreshCurrentSnapshot(env *Env, accts []store.Slot) {
 	}
 }
 
+// ClearLive stashes any active slot snapshot and removes local auth.json
+// without revoking server-side OAuth tokens. The returned restore func undoes it.
+func (x *Codex) ClearLive(env *Env) (func() error, error) {
+	accts, _ := x.Slots(env)
+	x.refreshCurrentSnapshot(env, accts)
+
+	lp := x.livePath(env)
+	raw, err := os.ReadFile(lp)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Remove(lp); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	restore := func() error {
+		return store.WriteBytesAtomic(lp, raw, 0o600, false)
+	}
+	return restore, nil
+}
+
 func (x *Codex) Status(env *Env) (StatusInfo, error) {
 	live := x.readLive(env)
 	if live == nil {

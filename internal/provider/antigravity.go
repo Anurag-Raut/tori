@@ -82,11 +82,17 @@ func (g *Antigravity) livePath(env *Env) (string, error) {
 	}
 	pattern := filepath.Join(env.Home, ".t3", "userdata", "providers", "antigravity", "*", "antigravity-acp", "acp_token.json")
 	found, err := filepath.Glob(pattern)
-	if err != nil || len(found) == 0 {
-		return "", Fail("no T3 Antigravity login found. Sign in to Antigravity in T3 Code first.")
+	if err == nil && len(found) > 0 {
+		sort.Strings(found)
+		return found[0], nil
 	}
-	sort.Strings(found)
-	return found[0], nil
+	dirPattern := filepath.Join(env.Home, ".t3", "userdata", "providers", "antigravity", "*", "antigravity-acp")
+	dirs, err := filepath.Glob(dirPattern)
+	if err == nil && len(dirs) > 0 {
+		sort.Strings(dirs)
+		return filepath.Join(dirs[0], "acp_token.json"), nil
+	}
+	return "", Fail("no T3 Antigravity login found. Sign in to Antigravity in T3 Code first.")
 }
 
 func (g *Antigravity) refreshToken(path string) string {
@@ -129,21 +135,44 @@ func (g *Antigravity) Current(env *Env, accts []store.Slot) *int {
 	return nil
 }
 
+// ClearLive removes local acp_token.json without revoking server-side Google OAuth tokens.
+// The returned restore func rewrites the backed-up bytes.
+func (g *Antigravity) ClearLive(env *Env) (func() error, error) {
+	lp, err := g.livePath(env)
+	if err != nil {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(lp)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Remove(lp); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	restore := func() error {
+		return store.WriteBytesAtomic(lp, raw, 0o600, false)
+	}
+	return restore, nil
+}
+
 func (g *Antigravity) Status(env *Env) (StatusInfo, error) {
 	accts, _ := g.Slots(env)
 	lp, err := g.livePath(env)
 	if err != nil {
 		return StatusInfo{LoggedIn: false, Message: "Not logged in to Antigravity."}, nil
 	}
+	if g.refreshToken(lp) == "" {
+		return StatusInfo{LoggedIn: false, Message: "Not logged in to Antigravity."}, nil
+	}
 	cur := g.Current(env, accts)
 	if cur == nil {
-		state := "missing"
-		if _, err := os.Stat(lp); err == nil {
-			state = "present"
-		}
 		return StatusInfo{
-			LoggedIn: state == "present",
-			Message:  fmt.Sprintf("Live login: %s, not saved (run `tori g add <alias>`).", state),
+			LoggedIn:    true,
+			DisplayName: "signed-in account",
+			Message:     "Live login: present, not saved (run `tori g add <alias>`).",
 		}, nil
 	}
 	var label string

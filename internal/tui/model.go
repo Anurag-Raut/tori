@@ -27,6 +27,13 @@ const (
 	modalDisclaimer
 )
 
+type addStep int
+
+const (
+	addStepGuide addStep = iota
+	addStepSave
+)
+
 type msgTone int
 
 const (
@@ -61,20 +68,31 @@ type actionDoneMsg struct {
 }
 
 type keyItem struct {
-	key   string
-	label string
+	key       string
+	label     string
+	actionKey string
+}
+
+type hitRect struct {
+	id     string
+	x0, x1 int
+	y      int
+}
+
+type boxRect struct {
+	x0, y0, x1, y1 int
 }
 
 var footerKeys = []keyItem{
-	{"↑↓", "move"},
-	{"⏎", "switch"},
-	{"⇥", "tool"},
-	{"a", "add"},
-	{"d", "remove"},
-	{"u", "usage"},
-	{"b", "rotate"},
-	{"r", "refresh"},
-	{"q", "quit"},
+	{"↑↓", "move", ""},
+	{"⏎", "switch", "enter"},
+	{"⇥", "tool", "tab"},
+	{"a", "add", "a"},
+	{"d", "remove", "d"},
+	{"u", "usage", "u"},
+	{"b", "rotate", "b"},
+	{"r", "refresh", "r"},
+	{"q", "quit", "q"},
 }
 
 var eighths = []rune{' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'}
@@ -99,12 +117,20 @@ type Model struct {
 	modal         modalKind
 	modalProvider provider.Provider
 	modalAccount  *provider.AccountEntry
+	addStep       addStep
+	addStatus     provider.StatusInfo
+	addNotice     string
+	addNoticeErr  bool
 	aliasInput    textinput.Model
-	spinner       spinner.Model
-	styles        palette
 
-	lastClickRow int
-	lastClickAt  time.Time
+	spinner spinner.Model
+	styles  palette
+
+	hoverRow      int
+	hoverFooter   string
+	hoverModalBtn string
+	lastClickRow  int
+	lastClickAt   time.Time
 }
 
 // NewModel initializes the TUI model synchronously from local disk/cache (zero network calls).
@@ -135,6 +161,7 @@ func NewModel(env *provider.Env) Model {
 		aliasInput:   ti,
 		spinner:      sp,
 		styles:       newPalette(),
+		hoverRow:     -1,
 		lastClickRow: -1,
 	}
 	m.styles.spinnerApply(&m.spinner)
@@ -313,6 +340,63 @@ func removeCmd(env *provider.Env, p provider.Provider, num int, meta provider.Ac
 	}
 }
 
+func switchAndRemoveCmd(env *provider.Env, p provider.Provider, switchTo int, removeNum int, meta provider.AccountEntry) tea.Cmd {
+	return func() tea.Msg {
+		e := *env
+		e.Warn = func(string) {}
+		out, err := provider.Switch(&e, p, fmt.Sprintf("%d", switchTo))
+		if err != nil {
+			return actionDoneMsg{ok: false, text: fmt.Sprintf("%s: %s", p.Title(), err.Error())}
+		}
+		slots, err := p.Slots(env)
+		if err != nil {
+			return actionDoneMsg{ok: false, text: err.Error(), refresh: true}
+		}
+		for _, s := range slots {
+			if s.Number == removeNum {
+				if _, err := provider.Remove(env, p, s); err != nil {
+					return actionDoneMsg{ok: false, text: err.Error(), refresh: true}
+				}
+				switched := ""
+				if len(out) > 0 {
+					switched = out[0]
+				}
+				return actionDoneMsg{
+					ok:      true,
+					text:    fmt.Sprintf("%s: %s — removed %s", p.Title(), switched, meta.Email),
+					refresh: true,
+				}
+			}
+		}
+		return actionDoneMsg{ok: false, text: fmt.Sprintf("Slot %d (%s) no longer exists.", removeNum, meta.Email), refresh: true}
+	}
+}
+
+func removeAndClearCmd(env *provider.Env, p provider.Provider, num int, meta provider.AccountEntry) tea.Cmd {
+	return func() tea.Msg {
+		slots, err := p.Slots(env)
+		if err != nil {
+			return actionDoneMsg{ok: false, text: err.Error()}
+		}
+		for _, s := range slots {
+			if s.Number == num {
+				if _, err := provider.Remove(env, p, s); err != nil {
+					return actionDoneMsg{ok: false, text: err.Error()}
+				}
+				if _, err := p.ClearLive(env); err != nil {
+					return actionDoneMsg{ok: false, text: fmt.Sprintf("Removed slot %d, but failed to clear local login: %v", num, err), refresh: true}
+				}
+				return actionDoneMsg{
+					ok:      true,
+					text:    fmt.Sprintf("%s: removed %s and cleared local login", p.Title(), meta.Email),
+					refresh: true,
+				}
+			}
+		}
+		return actionDoneMsg{ok: false, text: fmt.Sprintf("Slot %d (%s) no longer exists.", num, meta.Email)}
+	}
+}
+
 func rotateAllCmd(env *provider.Env, providers []provider.Provider) tea.Cmd {
 	return func() tea.Msg {
 		e := *env
@@ -412,39 +496,155 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) nextOtherAccount(pKey string, excludeNum int) *provider.AccountEntry {
+	accts := m.data[pKey]
+	if len(accts) < 2 {
+		return nil
+	}
+	// Prefer the next slot after excludeNum, wrapping around.
+	for _, a := range accts {
+		if a.Number > excludeNum {
+			cp := a
+			return &cp
+		}
+	}
+	for _, a := range accts {
+		if a.Number != excludeNum {
+			cp := a
+			return &cp
+		}
+	}
+	return nil
+}
+
+func (m Model) cancelAddModal() (Model, tea.Cmd) {
+	m.modal = modalNone
+	m.hoverModalBtn = ""
+	m.aliasInput.Blur()
+	m.addNotice = ""
+	m.addNoticeErr = false
+	m.statusMsg = "Cancelled."
+	m.statusTone = toneYellow
+	return m, nil
+}
+
+func (m Model) recheckAddStatus() (Model, tea.Cmd) {
+	p := m.modalProvider
+	st, _ := p.Status(m.env)
+	m.addStatus = st
+	m.loadLocalData()
+	if st.LoggedIn && st.ManagedSlot == nil {
+		m.addStep = addStepSave
+		m.addNotice = ""
+		m.addNoticeErr = false
+		m.aliasInput.Reset()
+		cmd := m.aliasInput.Focus()
+		return m, cmd
+	}
+	if st.LoggedIn && st.ManagedSlot != nil {
+		m.addNotice = fmt.Sprintf("Still signed in as %s (already slot %d). Log out and sign in to a different account first.", st.DisplayName, *st.ManagedSlot)
+		m.addNoticeErr = false
+		return m, nil
+	}
+	m.addNotice = "No signed-in account found yet. Sign in first, then press r (Re-check)."
+	m.addNoticeErr = false
+	return m, nil
+}
+
+func (m Model) cycleAddProvider(delta int) (Model, tea.Cmd) {
+	if len(m.providers) == 0 {
+		return m, nil
+	}
+	idx := 0
+	if m.modalProvider != nil {
+		for i, prov := range m.providers {
+			if prov.Key() == m.modalProvider.Key() {
+				idx = i
+				break
+			}
+		}
+	}
+	nextIdx := (idx + delta + len(m.providers)) % len(m.providers)
+	return m.openAddModal(m.providers[nextIdx])
+}
+
+func (m Model) triggerModalAction(id string) (tea.Model, tea.Cmd) {
+	m.hoverModalBtn = ""
 	switch m.modal {
 	case modalAdd:
-		switch msg.String() {
-		case "esc":
-			m.modal = modalNone
-			m.aliasInput.Blur()
-			m.statusMsg = "Cancelled."
-			m.statusTone = toneYellow
+		if key, ok := strings.CutPrefix(id, "tab:"); ok {
+			for _, prov := range m.providers {
+				if prov.Key() == key {
+					return m.openAddModal(prov)
+				}
+			}
 			return m, nil
-		case "enter":
-			alias := m.aliasInput.Value()
-			p := m.modalProvider
-			m.modal = modalNone
-			m.aliasInput.Blur()
-			m.statusMsg = "Saving account..."
-			m.statusTone = toneYellow
-			return m, addCmd(m.env, p, alias)
-		default:
-			var cmd tea.Cmd
-			m.aliasInput, cmd = m.aliasInput.Update(msg)
-			return m, cmd
+		}
+		if m.addStep == addStepSave {
+			switch id {
+			case "cancel":
+				return m.cancelAddModal()
+			case "save":
+				alias := m.aliasInput.Value()
+				p := m.modalProvider
+				m.modal = modalNone
+				m.aliasInput.Blur()
+				m.addNotice = ""
+				m.addNoticeErr = false
+				m.statusMsg = "Saving account..."
+				m.statusTone = toneYellow
+				return m, addCmd(m.env, p, alias)
+			}
+			return m, nil
+		}
+
+		switch id {
+		case "cancel":
+			return m.cancelAddModal()
+		case "recheck":
+			return m.recheckAddStatus()
+		case "update":
+			if m.addStatus.ManagedSlot != nil {
+				m.addStep = addStepSave
+				m.addNotice = ""
+				m.addNoticeErr = false
+				m.aliasInput.Reset()
+				cmd := m.aliasInput.Focus()
+				return m, cmd
+			}
 		}
 
 	case modalDelete:
-		switch msg.String() {
-		case "y", "Y":
+		switch id {
+		case "remove":
 			p := m.modalProvider
 			acct := *m.modalAccount
 			m.modal = modalNone
 			m.modalAccount = nil
 			return m, removeCmd(m.env, p, acct.Number, acct)
-		case "n", "N", "esc":
+		case "switch_remove":
+			if m.modalAccount != nil && m.modalAccount.Active {
+				if other := m.nextOtherAccount(m.modalProvider.Key(), m.modalAccount.Number); other != nil {
+					p := m.modalProvider
+					acct := *m.modalAccount
+					m.modal = modalNone
+					m.modalAccount = nil
+					m.statusMsg = "Switching & removing..."
+					m.statusTone = toneYellow
+					return m, switchAndRemoveCmd(m.env, p, other.Number, acct.Number, acct)
+				}
+			}
+		case "remove_clear":
+			if m.modalAccount != nil && m.modalAccount.Active && len(m.data[m.modalProvider.Key()]) == 1 {
+				p := m.modalProvider
+				acct := *m.modalAccount
+				m.modal = modalNone
+				m.modalAccount = nil
+				m.statusMsg = "Removing & clearing local login..."
+				m.statusTone = toneYellow
+				return m, removeAndClearCmd(m.env, p, acct.Number, acct)
+			}
+		case "cancel":
 			m.modal = modalNone
 			m.modalAccount = nil
 			m.statusMsg = "Cancelled."
@@ -453,8 +653,8 @@ func (m Model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case modalDisclaimer:
-		switch msg.String() {
-		case "y", "Y", "enter":
+		switch id {
+		case "accept":
 			p := m.modalProvider
 			m.modal = modalNone
 			if err := config.SetUsage(m.env.Root, []string{p.Key()}, true); err != nil {
@@ -471,11 +671,81 @@ func (m Model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.spinner.Tick,
 				fetchUsageCmd(m.env, m.providers, false, p.Key(), fmt.Sprintf("%s: usage meters on", p.Title())),
 			)
-		case "n", "N", "esc":
+		case "cancel":
 			m.modal = modalNone
 			m.statusMsg = "Cancelled."
 			m.statusTone = toneYellow
 			return m, nil
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.modal {
+	case modalAdd:
+		if m.addStep == addStepSave {
+			switch msg.String() {
+			case "esc":
+				return m.triggerModalAction("cancel")
+			case "enter":
+				return m.triggerModalAction("save")
+			case "tab":
+				return m.cycleAddProvider(1)
+			case "shift+tab":
+				return m.cycleAddProvider(-1)
+			case "left":
+				if m.aliasInput.Value() == "" {
+					return m.cycleAddProvider(-1)
+				}
+				var cmd tea.Cmd
+				m.aliasInput, cmd = m.aliasInput.Update(msg)
+				return m, cmd
+			case "right":
+				if m.aliasInput.Value() == "" {
+					return m.cycleAddProvider(1)
+				}
+				var cmd tea.Cmd
+				m.aliasInput, cmd = m.aliasInput.Update(msg)
+				return m, cmd
+			default:
+				var cmd tea.Cmd
+				m.aliasInput, cmd = m.aliasInput.Update(msg)
+				return m, cmd
+			}
+		}
+
+		switch msg.String() {
+		case "esc":
+			return m.triggerModalAction("cancel")
+		case "left", "h", "shift+tab":
+			return m.cycleAddProvider(-1)
+		case "right", "l", "tab":
+			return m.cycleAddProvider(1)
+		case "r", "R", "enter":
+			return m.triggerModalAction("recheck")
+		case "s", "S":
+			return m.triggerModalAction("update")
+		}
+
+	case modalDelete:
+		switch msg.String() {
+		case "y", "Y":
+			return m.triggerModalAction("remove")
+		case "s", "S":
+			return m.triggerModalAction("switch_remove")
+		case "c", "C":
+			return m.triggerModalAction("remove_clear")
+		case "n", "N", "esc":
+			return m.triggerModalAction("cancel")
+		}
+
+	case modalDisclaimer:
+		switch msg.String() {
+		case "y", "Y", "enter":
+			return m.triggerModalAction("accept")
+		case "n", "N", "esc":
+			return m.triggerModalAction("cancel")
 		}
 	}
 	return m, nil
@@ -562,6 +832,7 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.modal = modalDelete
 		m.modalProvider = row.provider
 		m.modalAccount = &acctCopy
+		m.hoverModalBtn = ""
 		return m, nil
 
 	case "u":
@@ -583,6 +854,7 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.modal = modalDisclaimer
 		m.modalProvider = p
+		m.hoverModalBtn = ""
 		return m, nil
 
 	case "b":
@@ -608,25 +880,98 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) openAddModal(p provider.Provider) (Model, tea.Cmd) {
+	st, _ := p.Status(m.env)
 	m.modal = modalAdd
 	m.modalProvider = p
+	m.addStatus = st
+	m.addNotice = ""
+	m.addNoticeErr = false
+	m.hoverModalBtn = ""
 	m.aliasInput.Reset()
 	if p.Key() == "antigravity" {
 		m.aliasInput.Placeholder = "alias (optional, e.g. primary)"
 	} else {
 		m.aliasInput.Placeholder = "optional alias (Enter for none)"
 	}
-	cmd := m.aliasInput.Focus()
-	return m, cmd
+	if st.LoggedIn && st.ManagedSlot == nil {
+		m.addStep = addStepSave
+		cmd := m.aliasInput.Focus()
+		return m, cmd
+	}
+	m.addStep = addStepGuide
+	m.aliasInput.Blur()
+	return m, nil
+}
+
+func keyFromAction(action string) tea.KeyMsg {
+	switch action {
+	case "enter":
+		return tea.KeyMsg{Type: tea.KeyEnter}
+	case "tab":
+		return tea.KeyMsg{Type: tea.KeyTab}
+	default:
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(action)}
+	}
 }
 
 func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	// Modal mouse hover & click handling.
 	if m.modal != modalNone {
+		_, hits, boxR := m.buildModal()
+		switch {
+		case msg.Action == tea.MouseActionMotion:
+			hovered := ""
+			for _, h := range hits {
+				if msg.Y == h.y && msg.X >= h.x0 && msg.X < h.x1 {
+					hovered = h.id
+					break
+				}
+			}
+			m.hoverModalBtn = hovered
+			return m, nil
+
+		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+			for _, h := range hits {
+				if msg.Y == h.y && msg.X >= h.x0 && msg.X < h.x1 {
+					return m.triggerModalAction(h.id)
+				}
+			}
+			// Clicking outside the modal box cancels cleanly (like Esc).
+			if msg.X < boxR.x0 || msg.X >= boxR.x1 || msg.Y < boxR.y0 || msg.Y >= boxR.y1 {
+				return m.triggerModalAction("cancel")
+			}
+		}
 		return m, nil
 	}
+
 	flat := m.rows()
 	n := len(flat)
 	if n == 0 {
+		return m, nil
+	}
+
+	// Hover tracking across rows and clickable footer pills.
+	if msg.Action == tea.MouseActionMotion {
+		layout := m.computeLayout()
+		bodyH := m.bodyHeight(layout.footerHeight)
+		footerTopY := bodyH + 1
+
+		m.hoverRow = -1
+		m.hoverFooter = ""
+		if msg.Y >= 0 && msg.Y < bodyH {
+			bodyLine := msg.Y + m.offset
+			if rowIdx, ok := layout.lineToRow[bodyLine]; ok && rowIdx >= 0 && rowIdx < n {
+				m.hoverRow = rowIdx
+			}
+		} else if msg.Y >= footerTopY {
+			fy := msg.Y - footerTopY
+			for _, h := range layout.footerHits {
+				if fy == h.y && msg.X >= h.x0 && msg.X < h.x1 {
+					m.hoverFooter = h.id
+					break
+				}
+			}
+		}
 		return m, nil
 	}
 
@@ -651,6 +996,19 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		layout := m.computeLayout()
 		bodyH := m.bodyHeight(layout.footerHeight)
+		footerTopY := bodyH + 1
+
+		// Click on a footer action button.
+		if msg.Y >= footerTopY {
+			fy := msg.Y - footerTopY
+			for _, h := range layout.footerHits {
+				if fy == h.y && msg.X >= h.x0 && msg.X < h.x1 {
+					return m.handleMainKey(keyFromAction(h.id))
+				}
+			}
+			return m, nil
+		}
+
 		if msg.Y < 0 || msg.Y >= bodyH {
 			return m, nil
 		}
@@ -662,12 +1020,12 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		now := m.now()
 		isDouble := m.lastClickRow == rowIdx && now.Sub(m.lastClickAt) < 450*time.Millisecond
 		m.cur = rowIdx
+		m.hoverRow = rowIdx
 		m.lastClickRow = rowIdx
 		m.lastClickAt = now
 		m.syncScroll()
 
 		if isDouble {
-			m.lastClickRow = -1
 			row := flat[rowIdx]
 			if row.account == nil {
 				return m.openAddModal(row.provider)
@@ -681,7 +1039,6 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.statusTone = toneYellow
 			return m, switchCmd(m.env, row.provider, fmt.Sprintf("%d", row.account.Number))
 		}
-		return m, nil
 	}
 	return m, nil
 }
@@ -745,22 +1102,32 @@ type layoutResult struct {
 	rowToLine    []int
 	lineToRow    map[int]int
 	footerLines  []string
+	footerHits   []hitRect
 	footerHeight int
 }
 
-func (m Model) renderFooter() []string {
+func (m Model) renderFooter() ([]string, []hitRect) {
 	w := m.width
 	gap := 2
 	if w < 90 {
 		gap = 1
 	}
 	var rows []string
+	var hits []hitRect
 	var cur strings.Builder
 	cur.WriteString(" ")
 	x := 1
+	rowIdx := 0
 	for _, item := range footerKeys {
-		capStr := m.styles.keycap.Render(item.key)
-		labStr := " " + m.styles.muted.Render(item.label)
+		hovered := item.actionKey != "" && item.actionKey == m.hoverFooter
+		capStyle := m.styles.keycap
+		labStyle := m.styles.muted
+		if hovered {
+			capStyle = m.styles.keycapHover
+			labStyle = m.styles.bold
+		}
+		capStr := capStyle.Render(item.key)
+		labStr := " " + labStyle.Render(item.label)
 		itemStr := capStr + labStr
 		need := lipgloss.Width(itemStr)
 		if x+need > w-1 && x > 1 {
@@ -768,10 +1135,19 @@ func (m Model) renderFooter() []string {
 			cur.Reset()
 			cur.WriteString(" ")
 			x = 1
+			rowIdx++
 		}
 		if x > 1 {
 			cur.WriteString(strings.Repeat(" ", gap))
 			x += gap
+		}
+		if item.actionKey != "" {
+			hits = append(hits, hitRect{
+				id: item.actionKey,
+				x0: x,
+				x1: x + need,
+				y:  rowIdx,
+			})
 		}
 		cur.WriteString(itemStr)
 		x += need
@@ -782,7 +1158,7 @@ func (m Model) renderFooter() []string {
 	if len(rows) == 0 {
 		rows = []string{""}
 	}
-	return rows
+	return rows, hits
 }
 
 func smoothMeter(pct float64, width int) (string, string) {
@@ -901,7 +1277,7 @@ func padRightWidth(s string, target int) string {
 }
 
 func (m Model) computeLayout() layoutResult {
-	footerLines := m.renderFooter()
+	footerLines, footerHits := m.renderFooter()
 	w := m.width
 	cw := max(30, min(w-2, 112))
 	inner := cw - 2
@@ -998,7 +1374,8 @@ func (m Model) computeLayout() layoutResult {
 		if m.usageOn[p.Key()] {
 			tag = " · usage on"
 		}
-		titlePart := m.styles.accent.Bold(true).Render(" "+p.Title()) +
+		b := m.styles.brand(p.Key())
+		titlePart := " " + b.iconStyle.Render(b.icon+" "+p.Title()) +
 			m.styles.muted.Render(count) +
 			m.styles.dim.Render(tag+" ")
 		titleW := lipgloss.Width(titlePart)
@@ -1008,40 +1385,46 @@ func (m Model) computeLayout() layoutResult {
 
 		if errText != "" || len(accts) == 0 {
 			sel := idx == m.cur
+			hov := idx == m.hoverRow && !sel
 			rowToLine[idx] = len(lines)
 			lineToRow[len(lines)] = idx
 			mark := " "
 			if sel {
 				mark = m.styles.accent.Bold(true).Render("▌")
+			} else if hov {
+				mark = m.styles.accent.Render("›")
 			}
 			var msg string
 			if errText != "" {
 				msg = m.styles.red.Render(truncateRunes("error: "+errText, max(10, inner-4)))
 			} else {
 				st := m.styles.muted
-				if sel {
+				if sel || hov {
 					st = m.styles.text
 				}
-				msg = st.Render(truncateRunes("no accounts yet — press a to save the signed-in login", max(10, inner-4)))
+				msg = st.Render(truncateRunes("no accounts yet — press a or click to add", max(10, inner-4)))
 			}
 			lines = append(lines, boxed(" "+mark+" "+msg))
 			idx++
 		} else {
 			for _, a := range accts {
 				sel := idx == m.cur
+				hov := idx == m.hoverRow && !sel
 				rowToLine[idx] = len(lines)
 				lineToRow[len(lines)] = idx
 
 				mark := " "
 				if sel {
 					mark = m.styles.accent.Bold(true).Render("▌")
+				} else if hov {
+					mark = m.styles.accent.Render("›")
 				}
 				dot := m.styles.track.Render("○")
 				if a.Active {
 					dot = m.styles.green.Render("●")
 				}
 				nameStyle := m.styles.muted
-				if a.Active || sel {
+				if a.Active || sel || hov {
 					nameStyle = m.styles.text
 					if sel {
 						nameStyle = m.styles.bold
@@ -1133,58 +1516,301 @@ func (m Model) computeLayout() layoutResult {
 		rowToLine:    rowToLine,
 		lineToRow:    lineToRow,
 		footerLines:  footerLines,
+		footerHits:   footerHits,
 		footerHeight: len(footerLines),
 	}
 }
 
-func (m Model) renderModal() string {
-	bw := max(32, min(m.width-4, 76))
+type modalBtnSpec struct {
+	id    string
+	label string
+	kind  string // "ok", "del", "no"
+}
+
+func (m Model) renderBtn(b modalBtnSpec) string {
+	hov := b.id == m.hoverModalBtn
+	switch b.kind {
+	case "ok":
+		if hov {
+			return m.styles.btnOkHover.Render(b.label)
+		}
+		return m.styles.btnOk.Render(b.label)
+	case "del":
+		if hov {
+			return m.styles.btnDelHover.Render(b.label)
+		}
+		return m.styles.btnDel.Render(b.label)
+	default:
+		if hov {
+			return m.styles.btnNoHover.Render(b.label)
+		}
+		return m.styles.btnNo.Render(b.label)
+	}
+}
+
+func (m Model) buildModal() (string, []hitRect, boxRect) {
+	bw := max(32, min(m.width-4, 72))
+	wrap := func(w int, s string) string {
+		if w < 20 {
+			w = 20
+		}
+		return lipgloss.NewStyle().Width(w).Render(s)
+	}
+
+	type relHit struct {
+		id     string
+		x0, x1 int
+		line   int
+	}
+	var extraRelHits []relHit
+	var parts []string
+	var btnSpecs []modalBtnSpec
+	boxW := min(bw, 66)
+
 	switch m.modal {
 	case modalAdd:
-		title := m.styles.accent.Bold(true).Render(fmt.Sprintf("Add %s account", m.modalProvider.Title()))
-		hint := m.styles.muted.Render("Saves the currently signed-in login.")
-		if m.modalProvider.Key() == "antigravity" {
-			hint = m.styles.muted.Render("Saves the signed-in Antigravity login (alias optional; email loads with usage).")
+		p := m.modalProvider
+		bodyW := boxW - 6
+
+		// Build interactive provider tab strip (←/→ or click to switch tool).
+		var tabStrs []string
+		tx := 0
+		for i, prov := range m.providers {
+			b := m.styles.brand(prov.Key())
+			tabID := "tab:" + prov.Key()
+			label := b.icon + " " + prov.Title()
+			var rendered string
+			if prov.Key() == p.Key() {
+				rendered = b.tabActive.Render(label)
+			} else if m.hoverModalBtn == tabID {
+				rendered = b.tabHover.Render(label)
+			} else {
+				rendered = b.tabIdle.Render(label)
+			}
+			tw := lipgloss.Width(rendered)
+			if i > 0 {
+				tx += 2
+			}
+			// Line 0 is title, line 1 is blank, line 2 is tab strip.
+			extraRelHits = append(extraRelHits, relHit{id: tabID, x0: tx, x1: tx + tw, line: 2})
+			tx += tw
+			tabStrs = append(tabStrs, rendered)
 		}
-		inputBox := m.aliasInput.View()
-		btns := m.styles.btnOk.Render("Enter: Save") + "  " + m.styles.btnNo.Render("Esc: Cancel")
-		content := lipgloss.JoinVertical(lipgloss.Left, title, hint, "", inputBox, "", btns)
-		return m.styles.modal.Width(min(bw, 60)).Render(content)
+		title := m.styles.bold.Render("Add account") + "   " + m.styles.muted.Render("←/→ or click tool")
+		tabBar := strings.Join(tabStrs, "  ")
+
+		if m.addStep == addStepSave {
+			var statusLine string
+			if m.addStatus.ManagedSlot != nil {
+				statusLine = m.styles.yellow.Render(fmt.Sprintf("● Updating slot %d: %s", *m.addStatus.ManagedSlot, m.addStatus.DisplayName))
+			} else if p.Key() == "antigravity" {
+				statusLine = m.styles.green.Render("● Live Antigravity login detected")
+			} else {
+				statusLine = m.styles.green.Render(fmt.Sprintf("● Ready to save: %s", m.addStatus.DisplayName))
+			}
+			parts = []string{title, "", tabBar, "", statusLine}
+			if p.Key() == "antigravity" {
+				parts = append(parts, m.styles.muted.Render(wrap(bodyW, "Give it an optional alias (Google email loads automatically when usage meters are on).")))
+			}
+			parts = append(parts, "", m.aliasInput.View(), "")
+			btnSpecs = []modalBtnSpec{
+				{id: "save", label: "Enter: Save", kind: "ok"},
+				{id: "cancel", label: "Esc: Cancel", kind: "no"},
+			}
+		} else {
+			parts = []string{title, "", tabBar, ""}
+			if m.addStatus.ManagedSlot != nil {
+				parts = append(parts, m.styles.green.Render(wrap(bodyW, fmt.Sprintf("● Already saved: %s (slot %d)", m.addStatus.DisplayName, *m.addStatus.ManagedSlot))))
+			} else {
+				parts = append(parts, m.styles.muted.Render("○ Not currently signed in."))
+			}
+			parts = append(parts, "")
+
+			var step1 string
+			switch p.Key() {
+			case "claude":
+				if m.addStatus.ManagedSlot != nil {
+					step1 = "1. Log out and sign in to another account in Claude Code."
+				} else {
+					step1 = "1. Sign in to Claude Code (`claude` → /login)."
+				}
+			case "codex":
+				if m.addStatus.ManagedSlot != nil {
+					step1 = "1. Log out and sign in to another account in Codex (`codex login`)."
+				} else {
+					step1 = "1. Sign in to Codex (`codex login`)."
+				}
+			default:
+				if m.addStatus.ManagedSlot != nil {
+					step1 = "1. Log out and sign in to another account in T3 Code (Antigravity)."
+				} else {
+					step1 = "1. Sign in to Antigravity in T3 Code."
+				}
+			}
+			parts = append(parts,
+				m.styles.text.Render(wrap(bodyW, step1)),
+				m.styles.text.Render(wrap(bodyW, "2. Press r (or click Re-check) — Tori will add it if it isn't already saved.")),
+			)
+
+			if m.addNotice != "" {
+				noticeStyle := m.styles.yellow
+				if m.addNoticeErr {
+					noticeStyle = m.styles.red
+				}
+				parts = append(parts, "", noticeStyle.Render(wrap(bodyW, m.addNotice)))
+			}
+
+			btnSpecs = append(btnSpecs, modalBtnSpec{id: "recheck", label: "r / Enter: Re-check", kind: "ok"})
+			if m.addStatus.ManagedSlot != nil {
+				btnSpecs = append(btnSpecs, modalBtnSpec{id: "update", label: fmt.Sprintf("s: Update slot %d", *m.addStatus.ManagedSlot), kind: "no"})
+			}
+			btnSpecs = append(btnSpecs, modalBtnSpec{id: "cancel", label: "Esc: Cancel", kind: "no"})
+			parts = append(parts, "")
+		}
 
 	case modalDelete:
-		title := m.styles.red.Bold(true).Render(fmt.Sprintf("Remove %s slot %d?", m.modalProvider.Title(), m.modalAccount.Number))
+		bodyW := boxW - 6
+		b := m.styles.brand(m.modalProvider.Key())
+		title := m.styles.red.Bold(true).Render(fmt.Sprintf("Remove %s %s slot %d?", b.icon, m.modalProvider.Title(), m.modalAccount.Number))
 		who := m.styles.bold.Render(m.modalAccount.Email)
 		if m.modalAccount.Alias != nil && *m.modalAccount.Alias != "" {
 			who += " " + m.styles.muted.Render("["+*m.modalAccount.Alias+"]")
 		}
-		note := m.styles.muted.Render("This only forgets the saved login; remaining slots are renumbered.")
-		btns := m.styles.btnDel.Render("y: Remove") + "  " + m.styles.btnNo.Render("n / Esc: Cancel")
-		content := lipgloss.JoinVertical(lipgloss.Left, title, "", who, note, "", btns)
-		return m.styles.modal.Width(min(bw, 62)).Render(content)
+		if m.modalAccount.Active {
+			who += "  " + m.styles.yellow.Render("● active")
+		}
+
+		parts = []string{title, "", who, ""}
+		if m.modalAccount.Active {
+			other := m.nextOtherAccount(m.modalProvider.Key(), m.modalAccount.Number)
+			if other != nil {
+				parts = append(parts, m.styles.text.Render(wrap(bodyW, "This account is currently active. Removing only forgets Tori's saved copy — your live login stays signed in unless you switch.")))
+				parts = append(parts, m.styles.muted.Render(wrap(bodyW, fmt.Sprintf("Tip: press s to switch to %s and remove this slot in one step.", other.Email))))
+				btnSpecs = append(btnSpecs,
+					modalBtnSpec{id: "switch_remove", label: "s: Switch & remove", kind: "ok"},
+					modalBtnSpec{id: "remove", label: "y: Remove only", kind: "del"},
+				)
+			} else {
+				parts = append(parts, m.styles.text.Render(wrap(bodyW, "This is your active login. Removing only forgets Tori's saved copy — your account is not deleted.")))
+				parts = append(parts, m.styles.muted.Render(wrap(bodyW, "Press c to also clear the local login file on this machine.")))
+				btnSpecs = append(btnSpecs,
+					modalBtnSpec{id: "remove", label: "y: Remove only", kind: "del"},
+					modalBtnSpec{id: "remove_clear", label: "c: Remove & clear login", kind: "no"},
+				)
+			}
+		} else {
+			parts = append(parts, m.styles.muted.Render(wrap(bodyW, "Only forgets Tori's saved copy — your account and current login are untouched. Remaining slots are renumbered.")))
+			btnSpecs = append(btnSpecs, modalBtnSpec{id: "remove", label: "y: Remove", kind: "del"})
+		}
+		btnSpecs = append(btnSpecs, modalBtnSpec{id: "cancel", label: "n / Esc: Cancel", kind: "no"})
+		parts = append(parts, "")
 
 	case modalDisclaimer:
-		title := m.styles.accent.Bold(true).Render(fmt.Sprintf("Turn on usage meters for %s?", m.modalProvider.Title()))
-		paras := config.DisclaimerLines([]string{m.modalProvider.Key()})
-		bodyW := min(bw, 72) - 6
-		if bodyW < 24 {
-			bodyW = 24
+		boxW = min(bw, 64)
+		bodyW := boxW - 6
+		p := m.modalProvider
+		b := m.styles.brand(p.Key())
+		title := m.styles.bold.Render("Turn on usage meters for ") + b.iconStyle.Render(b.icon+" "+p.Title()) + m.styles.bold.Render("?")
+		parts = []string{
+			title,
+			"",
+			m.styles.text.Render(wrap(bodyW, config.DisclaimerHead)),
 		}
-		var wrapped []string
-		for _, p := range paras {
-			if p == config.DisclaimerTail {
-				wrapped = append(wrapped, "")
-			}
-			wrapped = append(wrapped, lipgloss.NewStyle().Width(bodyW).Render(p))
-			if !strings.HasPrefix(p, "- ") && p != config.DisclaimerTerms {
-				wrapped = append(wrapped, "")
-			}
+		warnText, hasWarn := config.DisclaimerTool[p.Key()]
+		if hasWarn {
+			parts = append(parts, "", m.styles.yellow.Bold(true).Render(wrap(bodyW, "⚠ "+warnText)))
 		}
-		body := m.styles.text.Render(strings.TrimRight(strings.Join(wrapped, "\n"), "\n"))
-		btns := m.styles.btnOk.Render("y / Enter: Accept & Turn On") + "  " + m.styles.btnNo.Render("n / Esc: Cancel")
-		content := lipgloss.JoinVertical(lipgloss.Left, title, "", body, "", btns)
-		return m.styles.modal.Width(min(bw, 74)).Render(content)
+		parts = append(parts, "", m.styles.muted.Render(wrap(bodyW, config.DisclaimerTail)), "")
+
+		okLabel := "y / Enter: Turn On"
+		if hasWarn {
+			okLabel = "y / Enter: Accept & Turn On"
+		}
+		btnSpecs = []modalBtnSpec{
+			{id: "accept", label: okLabel, kind: "ok"},
+			{id: "cancel", label: "n / Esc: Cancel", kind: "no"},
+		}
+	default:
+		return "", nil, boxRect{}
 	}
-	return ""
+
+	// Render buttons across 1 or 2 rows and record their relative hit coordinates.
+	bodyW := boxW - 6
+	renderedBtns := make([]string, len(btnSpecs))
+	widths := make([]int, len(btnSpecs))
+	totalW := 0
+	for i, b := range btnSpecs {
+		renderedBtns[i] = m.renderBtn(b)
+		widths[i] = lipgloss.Width(renderedBtns[i])
+		if i > 0 {
+			totalW += 2
+		}
+		totalW += widths[i]
+	}
+
+	preContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
+	btnStartLine := len(strings.Split(preContent, "\n"))
+
+	relHits := append([]relHit{}, extraRelHits...)
+	var btnRows string
+	if totalW > bodyW && len(btnSpecs) >= 3 {
+		x := 0
+		for i := 0; i < 2; i++ {
+			if i > 0 {
+				x += 2
+			}
+			relHits = append(relHits, relHit{id: btnSpecs[i].id, x0: x, x1: x + widths[i], line: btnStartLine})
+			x += widths[i]
+		}
+		x = 0
+		for i := 2; i < len(btnSpecs); i++ {
+			if i > 2 {
+				x += 2
+			}
+			relHits = append(relHits, relHit{id: btnSpecs[i].id, x0: x, x1: x + widths[i], line: btnStartLine + 2})
+			x += widths[i]
+		}
+		btnRows = strings.Join(renderedBtns[:2], "  ") + "\n\n" + strings.Join(renderedBtns[2:], "  ")
+	} else {
+		x := 0
+		for i := range btnSpecs {
+			if i > 0 {
+				x += 2
+			}
+			relHits = append(relHits, relHit{id: btnSpecs[i].id, x0: x, x1: x + widths[i], line: btnStartLine})
+			x += widths[i]
+		}
+		btnRows = strings.Join(renderedBtns, "  ")
+	}
+
+	fullContent := preContent + "\n" + btnRows
+	box := m.styles.modal.Width(boxW).Render(fullContent)
+
+	renderedW := lipgloss.Width(box)
+	renderedH := lipgloss.Height(box)
+	placeH := max(1, m.height-2)
+	leftX := max(0, (m.width-renderedW)/2)
+	topY := 1 + max(0, (placeH-renderedH)/2) // 1 for the top header line
+
+	// Modal box has 1-cell border + 1-line top padding + 2-col left padding.
+	innerX := leftX + 3
+	innerY := topY + 2
+	hits := make([]hitRect, 0, len(relHits))
+	for _, rh := range relHits {
+		hits = append(hits, hitRect{
+			id: rh.id,
+			x0: innerX + rh.x0,
+			x1: innerX + rh.x1,
+			y:  innerY + rh.line,
+		})
+	}
+	boxR := boxRect{
+		x0: leftX,
+		y0: topY,
+		x1: leftX + renderedW,
+		y1: topY + renderedH,
+	}
+	return box, hits, boxR
 }
 
 // View renders the TUI screen.
@@ -1197,7 +1823,7 @@ func (m Model) View() string {
 		header := " " + m.styles.accent.Bold(true).Render("◆ ") +
 			m.styles.bold.Render("Tori") +
 			m.styles.muted.Render("  AI account switcher")
-		modalBox := m.renderModal()
+		modalBox, _, _ := m.buildModal()
 		placed := lipgloss.Place(m.width, max(1, m.height-2), lipgloss.Center, lipgloss.Center, modalBox)
 		return header + "\n" + placed
 	}
@@ -1257,7 +1883,7 @@ func (m Model) View() string {
 // Run starts the interactive Bubble Tea TUI.
 func Run(env *provider.Env) int {
 	m := NewModel(env)
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithOutput(os.Stdout))
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion(), tea.WithOutput(os.Stdout))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tori: %v\n", err)
 		return 1

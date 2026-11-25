@@ -203,6 +203,7 @@ type Provider interface {
 	Status(env *Env) (StatusInfo, error)
 	Add(env *Env, args []string) ([]string, error)
 	Activate(env *Env, slot store.Slot, accts []store.Slot, cur *int) ([]string, error)
+	ClearLive(env *Env) (restore func() error, err error)
 
 	NameOf(n int, m store.Meta) string
 	Label(n int, m store.Meta) string
