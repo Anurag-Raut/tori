@@ -259,6 +259,7 @@ func (c *Claude) Add(env *Env, args []string) ([]string, error) {
 			if err := c.saveSlot(s.Dir, oauth, account, &s.Meta); err != nil {
 				return nil, err
 			}
+			ClearUsageCooldown(s.Dir)
 			return []string{fmt.Sprintf("Updated slot %d: %s", s.Number, c.Label(s.Number, s.Meta))}, nil
 		}
 	}

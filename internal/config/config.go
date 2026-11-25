@@ -9,8 +9,27 @@ import (
 )
 
 const (
-	// UsageTTL is the cache lifetime before a usage reading is fetched again.
+	// UsageTTL is the cache lifetime before a usage reading is fetched automatically.
 	UsageTTL = 180 * time.Second
+
+	// UsageMinRefresh is the minimum interval between manual refreshes (--refresh / r)
+	// for a slot that was just fetched, preventing rapid retries from hammering APIs.
+	UsageMinRefresh = 30 * time.Second
+
+	// UsageRateLimitBase and UsageRateLimitMax define exponential backoff on HTTP 429.
+	UsageRateLimitBase = 60 * time.Second
+	UsageRateLimitMax  = 15 * time.Minute
+
+	// UsageRetryAfterCap bounds any server-provided Retry-After header.
+	UsageRetryAfterCap = 60 * time.Minute
+
+	// UsageErrorBase and UsageErrorMax define exponential backoff on transient errors
+	// (5xx or network/offline failures).
+	UsageErrorBase = 30 * time.Second
+	UsageErrorMax  = 5 * time.Minute
+
+	// UsageAuthErrorCooldown avoids hammering endpoints when credentials are expired/invalid.
+	UsageAuthErrorCooldown = 60 * time.Second
 
 	DisclaimerHead = "Reads quota directly from the provider using your saved logins (may refresh expired tokens). Nothing is sent anywhere else."
 	DisclaimerTail = "You can turn this off any time."

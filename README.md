@@ -76,7 +76,7 @@ Run `tori` with no arguments to open the interactive Bubble Tea picker (supports
 
 Meters are optional and **off by default**. While a tool's meters are off, Tori makes zero network requests for it. Turn them on per tool with `u` in the picker or `tori usage on c` (also `x`, `g`, `all`); both show a disclaimer first, and the choice is saved in `~/.tori/config.json`. Switching, adding and removing accounts never need the network.
 
-Meters are green below 60%, yellow from 60%, red from 85%, with a reset countdown when known. Cached readings (180s TTL) are shown dimmed with their age when stale.
+Meters are green below 60%, yellow from 60%, red from 85%, with a reset countdown when known. Readings are cached locally (180s TTL), manual refreshes enforce a 30s minimum cooldown with in-flight request deduplication, and HTTP 429 / transient errors trigger persisted exponential backoff (honoring `Retry-After`) while keeping last-known cached bars.
 
 ## CLI reference
 

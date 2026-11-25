@@ -43,6 +43,7 @@ func Failf(format string, args ...any) error {
 // HTTPError represents a non-2xx HTTP response.
 type HTTPError struct {
 	StatusCode int
+	RetryAfter time.Duration
 }
 
 func (e *HTTPError) Error() string {
@@ -138,18 +139,23 @@ type Window struct {
 
 // UsageCache is the on-disk schema for usage.json in each slot.
 type UsageCache struct {
-	Windows   []Window       `json:"windows,omitempty"`
-	FiveHour  map[string]any `json:"fiveHour,omitempty"`
-	SevenDay  map[string]any `json:"sevenDay,omitempty"`
-	FetchedAt float64        `json:"fetchedAt,omitempty"`
+	Windows       []Window       `json:"windows,omitempty"`
+	FiveHour      map[string]any `json:"fiveHour,omitempty"`
+	SevenDay      map[string]any `json:"sevenDay,omitempty"`
+	FetchedAt     float64        `json:"fetchedAt,omitempty"`
+	CooldownUntil float64        `json:"cooldownUntil,omitempty"`
+	LastError     string         `json:"lastError,omitempty"`
+	FailCount     int            `json:"failCount,omitempty"`
 }
 
 // UsageInfo is the runtime usage summary returned in entries and --json.
 type UsageInfo struct {
-	Windows    []Window `json:"windows"`
-	FetchedAt  *float64 `json:"fetchedAt"`
-	AgeSeconds *int     `json:"ageSeconds"`
-	Error      *string  `json:"error"`
+	Windows           []Window `json:"windows"`
+	FetchedAt         *float64 `json:"fetchedAt"`
+	AgeSeconds        *int     `json:"ageSeconds"`
+	Error             *string  `json:"error"`
+	RetryAfterSeconds *int     `json:"retryAfterSeconds,omitempty"`
+	Throttled         bool     `json:"-"`
 }
 
 // PlanInfo matches the --json plan object {"label": "..."}.
@@ -421,39 +427,213 @@ func WindowsOf(cache UsageCache) []Window {
 	return out
 }
 
+type usageFlightCall struct {
+	done chan struct{}
+	wins []Window
+	err  error
+}
+
+var (
+	usageFlightMu sync.Mutex
+	usageFlights  = make(map[string]*usageFlightCall)
+)
+
+// coalesceUsageFetch ensures concurrent callers for the same slot share a single
+// in-flight HTTP fetch instead of firing duplicate requests.
+func coalesceUsageFetch(key string, fn func() ([]Window, error)) ([]Window, error) {
+	usageFlightMu.Lock()
+	if c, ok := usageFlights[key]; ok {
+		usageFlightMu.Unlock()
+		<-c.done
+		return c.wins, c.err
+	}
+	c := &usageFlightCall{done: make(chan struct{})}
+	usageFlights[key] = c
+	usageFlightMu.Unlock()
+
+	defer func() {
+		usageFlightMu.Lock()
+		delete(usageFlights, key)
+		usageFlightMu.Unlock()
+		close(c.done)
+	}()
+
+	c.wins, c.err = fn()
+	return c.wins, c.err
+}
+
+// ClearUsageCooldown resets persisted failure backoff for slotDir while keeping
+// any last-known usage windows (e.g. after updating credentials on re-login).
+func ClearUsageCooldown(slotDir string) {
+	path := filepath.Join(slotDir, "usage.json")
+	var cache UsageCache
+	if !store.ReadJSON(path, &cache) {
+		return
+	}
+	if cache.CooldownUntil == 0 && cache.LastError == "" && cache.FailCount == 0 {
+		return
+	}
+	cache.CooldownUntil = 0
+	cache.LastError = ""
+	cache.FailCount = 0
+	_ = store.WriteJSONAtomic(path, cache, 0o600, false)
+}
+
+func expBackoff(base, maxDur time.Duration, failCount int) time.Duration {
+	if failCount < 1 {
+		failCount = 1
+	}
+	dur := base
+	for i := 1; i < failCount; i++ {
+		if dur >= maxDur/2 {
+			return maxDur
+		}
+		dur *= 2
+	}
+	if dur > maxDur {
+		return maxDur
+	}
+	return dur
+}
+
+func usageErrorBackoff(err error, failCount int) time.Duration {
+	var he *HTTPError
+	if errors.As(err, &he) {
+		switch he.StatusCode {
+		case 429:
+			dur := expBackoff(config.UsageRateLimitBase, config.UsageRateLimitMax, failCount)
+			if he.RetryAfter > dur {
+				dur = he.RetryAfter
+			}
+			return dur
+		case 400, 401, 403:
+			return config.UsageAuthErrorCooldown
+		default:
+			dur := expBackoff(config.UsageErrorBase, config.UsageErrorMax, failCount)
+			if he.RetryAfter > dur {
+				dur = he.RetryAfter
+			}
+			return dur
+		}
+	}
+	if errors.Is(err, ErrPerm) {
+		return config.UsageAuthErrorCooldown
+	}
+	return expBackoff(config.UsageErrorBase, config.UsageErrorMax, failCount)
+}
+
+func parseRetryAfter(val string, now time.Time) time.Duration {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(val); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		dur := time.Duration(secs) * time.Second
+		if dur > config.UsageRetryAfterCap {
+			return config.UsageRetryAfterCap
+		}
+		return dur
+	}
+	if t, err := http.ParseTime(val); err == nil {
+		dur := t.Sub(now)
+		if dur <= 0 {
+			return 0
+		}
+		if dur > config.UsageRetryAfterCap {
+			return config.UsageRetryAfterCap
+		}
+		return dur
+	}
+	return 0
+}
+
 // UsageForSlot reads cached usage and refreshes over network when enabled and due.
 // Never makes a network call when usage is disabled for p or network is false.
+// Repeated retries honor persisted failure/429 backoff (plus HTTP Retry-After),
+// a minimum manual refresh interval, and per-slot in-flight coalescing.
 func UsageForSlot(env *Env, p Provider, slot store.Slot, active bool, ctx any, network, force bool) *UsageInfo {
 	if p.NoUsage(slot.Meta) || !env.IsUsageEnabled(p.Key()) {
 		return nil
 	}
 	now := float64(env.now().UnixNano()) / 1e9
+	usagePath := filepath.Join(slot.Dir, "usage.json")
 	var cache UsageCache
-	_ = store.ReadJSON(filepath.Join(slot.Dir, "usage.json"), &cache)
+	_ = store.ReadJSON(usagePath, &cache)
+	prevFetched := cache.FetchedAt
 	cache = p.Preload(env, slot, cache)
+	if cache.FetchedAt > prevFetched {
+		// Preload supplied fresher local data; clear any stale failure backoff.
+		cache.CooldownUntil = 0
+		cache.LastError = ""
+		cache.FailCount = 0
+	}
 
 	var errText string
+	var retryAfterSec int
+	throttled := false
+
 	fresh := cache.FetchedAt > 0 && (now-cache.FetchedAt) < config.UsageTTL.Seconds()
-	if network && !env.DisableNetwork && !(fresh && !force) {
-		wins, err := p.Fetch(env, slot, active, ctx)
+	inBackoff := cache.CooldownUntil > now
+	recentManual := force && cache.FetchedAt > 0 && (now-cache.FetchedAt) < config.UsageMinRefresh.Seconds()
+
+	if inBackoff {
+		retryAfterSec = int(math.Ceil(cache.CooldownUntil - now))
+		if retryAfterSec < 1 {
+			retryAfterSec = 1
+		}
+		if network && !env.DisableNetwork {
+			throttled = true
+		}
+		if cache.LastError != "" {
+			// Preserve quiet cached bars during short 429 grace period, just like fresh 429s.
+			if !(cache.LastError == "rate limited" && cache.FetchedAt > 0 && (now-cache.FetchedAt) < config.UsageTTL.Seconds()*2) {
+				errText = cache.LastError
+			}
+		}
+	} else if network && !env.DisableNetwork && recentManual {
+		retryAfterSec = int(math.Ceil(cache.FetchedAt + config.UsageMinRefresh.Seconds() - now))
+		if retryAfterSec < 1 {
+			retryAfterSec = 1
+		}
+		throttled = true
+	} else if network && !env.DisableNetwork && !(fresh && !force) {
+		flightKey := filepath.Clean(slot.Dir)
+		wins, err := coalesceUsageFetch(flightKey, func() ([]Window, error) {
+			return p.Fetch(env, slot, active, ctx)
+		})
 		if err == nil {
 			cache = UsageCache{Windows: wins, FetchedAt: now}
-			_ = store.WriteJSONAtomic(filepath.Join(slot.Dir, "usage.json"), cache, 0o600, false)
+			_ = store.WriteJSONAtomic(usagePath, cache, 0o600, false)
 		} else {
+			rawErr := "offline"
 			var he *HTTPError
 			if errors.As(err, &he) {
+				rawErr = HTTPStatusText(he.StatusCode)
 				if he.StatusCode == 429 && cache.FetchedAt > 0 && (now-cache.FetchedAt) < config.UsageTTL.Seconds()*2 {
 					errText = ""
 				} else {
-					errText = HTTPStatusText(he.StatusCode)
+					errText = rawErr
 				}
 			} else if errors.Is(err, ErrPerm) {
-				errText = p.PermError()
+				rawErr = p.PermError()
+				errText = rawErr
 			} else {
-				errText = "offline"
+				errText = rawErr
 			}
+			failCount := cache.FailCount + 1
+			dur := usageErrorBackoff(err, failCount)
+			cache.FailCount = failCount
+			cache.LastError = rawErr
+			cache.CooldownUntil = now + dur.Seconds()
+			_ = store.WriteJSONAtomic(usagePath, cache, 0o600, false)
+			retryAfterSec = int(math.Ceil(dur.Seconds()))
+			throttled = true
 		}
 	}
+
 	if cache.FetchedAt == 0 && errText == "" {
 		return nil
 	}
@@ -473,11 +653,18 @@ func UsageForSlot(env *Env, p Provider, slot store.Slot, active bool, ctx any, n
 		s := errText
 		errPtr = &s
 	}
+	var retryPtr *int
+	if retryAfterSec > 0 {
+		r := retryAfterSec
+		retryPtr = &r
+	}
 	return &UsageInfo{
-		Windows:    WindowsOf(cache),
-		FetchedAt:  fetchedPtr,
-		AgeSeconds: agePtr,
-		Error:      errPtr,
+		Windows:           WindowsOf(cache),
+		FetchedAt:         fetchedPtr,
+		AgeSeconds:        agePtr,
+		Error:             errPtr,
+		RetryAfterSeconds: retryPtr,
+		Throttled:         throttled,
 	}
 }
 
@@ -571,7 +758,10 @@ func HTTPJSON(env *Env, url string, body []byte, headers map[string]string) (map
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil, &HTTPError{StatusCode: resp.StatusCode}
+		return nil, &HTTPError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), env.now()),
+		}
 	}
 	var out map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -600,15 +790,22 @@ func UsageLine(u *UsageInfo, extra string) string {
 	if u == nil {
 		return ""
 	}
-	if u.Error != nil && *u.Error != "" && len(u.Windows) == 0 {
-		return *u.Error
+	errLabel := ""
+	if u.Error != nil && *u.Error != "" {
+		errLabel = *u.Error
+		if u.RetryAfterSeconds != nil && *u.RetryAfterSeconds > 0 {
+			errLabel += " · retry " + FmtWait(*u.RetryAfterSeconds)
+		}
+	}
+	if errLabel != "" && len(u.Windows) == 0 {
+		return errLabel
 	}
 	bits := make([]string, 0, len(u.Windows)+1)
 	for _, w := range u.Windows {
 		bits = append(bits, fmt.Sprintf("%s %s %3.0f%%", w.Label, Bar(w.Pct, 10), w.Pct))
 	}
-	if u.Error != nil && *u.Error != "" {
-		bits = append(bits, fmt.Sprintf("(%s)", *u.Error))
+	if errLabel != "" {
+		bits = append(bits, fmt.Sprintf("(%s)", errLabel))
 	}
 	return strings.Join(bits, "   ")
 }
@@ -683,6 +880,30 @@ func FmtAge(sec int) string {
 		return fmt.Sprintf("%dm ago", sec/60)
 	}
 	return fmt.Sprintf("%dh ago", sec/3600)
+}
+
+// FmtWait formats a short retry wait duration (e.g. "24s", "1m 30s", "5m").
+func FmtWait(sec int) string {
+	if sec <= 0 {
+		return "now"
+	}
+	if sec < 60 {
+		return fmt.Sprintf("%ds", sec)
+	}
+	m := sec / 60
+	s := sec % 60
+	if m < 5 && s > 0 {
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	if m < 60 {
+		return fmt.Sprintf("%dm", m)
+	}
+	h := m / 60
+	rm := m % 60
+	if rm == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh %dm", h, rm)
 }
 
 func titleCase(s string) string {
