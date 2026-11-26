@@ -1,0 +1,49 @@
+{
+  "name": "tori-cli",
+  "version": "0.0.0",
+  "description": "Switch between Claude Code, Codex, and Antigravity accounts from your terminal — with live quota bars.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Anurag-Raut/tori.git"
+  },
+  "homepage": "https://github.com/Anurag-Raut/tori#readme",
+  "bugs": {
+    "url": "https://github.com/Anurag-Raut/tori/issues"
+  },
+  "keywords": [
+    "tori",
+    "cli",
+    "tui",
+    "claude-code",
+    "codex",
+    "antigravity",
+    "account-switcher",
+    "quota"
+  ],
+  "bin": {
+    "tori": "bin/tori.js"
+  },
+  "files": [
+    "bin/tori.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "optionalDependencies": {
+    "tori-cli-linux-x64": "0.0.0",
+    "tori-cli-linux-arm64": "0.0.0",
+    "tori-cli-darwin-x64": "0.0.0",
+    "tori-cli-darwin-arm64": "0.0.0"
+  }
+}
