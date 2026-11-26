@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -17,8 +18,10 @@ func TestWriteBytesAtomicPermissionsAndKeep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat failed: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("expected perm 0600, got %o", perm)
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("expected perm 0600, got %o", perm)
+		}
 	}
 
 	// Verify keep=true preserves existing permissions.
@@ -33,8 +36,10 @@ func TestWriteBytesAtomicPermissionsAndKeep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info2.Mode().Perm(); perm != 0o644 {
-		t.Fatalf("expected preserved perm 0644, got %o", perm)
+	if runtime.GOOS != "windows" {
+		if perm := info2.Mode().Perm(); perm != 0o644 {
+			t.Fatalf("expected preserved perm 0644, got %o", perm)
+		}
 	}
 
 	// Ensure no leftover temp files.

@@ -109,6 +109,13 @@ func parseCodexCredStoreMode(tomlText string) string {
 
 // keyringAccount matches openai/codex's compute_store_key: "cli|" + sha256(canonical_codex_home)[:16].
 func (x *Codex) keyringAccount(env *Env) string {
+	return x.keyringAccounts(env)[0]
+}
+
+// keyringAccounts returns candidate keyring account keys for $CODEX_HOME.
+// On Windows, Rust's Path::canonicalize() prepends `\\?\`, so we check both the
+// verbatim and standard path hashes.
+func (x *Codex) keyringAccounts(env *Env) []string {
 	home := x.codexHome(env)
 	if abs, err := filepath.Abs(home); err == nil {
 		home = abs
@@ -118,26 +125,42 @@ func (x *Codex) keyringAccount(env *Env) string {
 	} else {
 		home = filepath.Clean(home)
 	}
-	sum := sha256.Sum256([]byte(home))
-	return "cli|" + hex.EncodeToString(sum[:])[:16]
+	hashKey := func(p string) string {
+		sum := sha256.Sum256([]byte(p))
+		return "cli|" + hex.EncodeToString(sum[:])[:16]
+	}
+	primary := hashKey(home)
+	if env.GOOS == "windows" {
+		winHome := strings.ReplaceAll(home, "/", `\`)
+		if !strings.HasPrefix(winHome, `\\?\`) {
+			verb := hashKey(`\\?\` + winHome)
+			if verb != primary {
+				return []string{verb, primary}
+			}
+		}
+	}
+	return []string{primary}
 }
 
 func (x *Codex) readKeyring(env *Env) (map[string]any, string, error) {
 	if env.getenv("TORI_CODEX_AUTH") != "" || env.Keyring == nil {
 		return nil, "", nil
 	}
-	raw, err := env.Keyring.Get(codexKeyringService, x.keyringAccount(env))
-	if err != nil {
-		if isKeyringNotFound(err) {
-			return nil, "", nil
+	var lastErr error
+	for _, acct := range x.keyringAccounts(env) {
+		raw, err := env.Keyring.Get(codexKeyringService, acct)
+		if err != nil {
+			if !isKeyringNotFound(err) && lastErr == nil {
+				lastErr = err
+			}
+			continue
 		}
-		return nil, "", err
+		var m map[string]any
+		if err := json.Unmarshal([]byte(raw), &m); err == nil && len(m) > 0 {
+			return m, raw, nil
+		}
 	}
-	var m map[string]any
-	if err := json.Unmarshal([]byte(raw), &m); err != nil || len(m) == 0 {
-		return nil, "", nil
-	}
-	return m, raw, nil
+	return nil, "", lastErr
 }
 
 func (x *Codex) jwtPayload(token string) map[string]any {

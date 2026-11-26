@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -257,8 +258,11 @@ func TestClaudeLifecycleAndUsage(t *testing.T) {
 		t.Fatalf("expected numStartups preserved, got %v", liveCfg["numStartups"])
 	}
 	st, err := os.Stat(cfgPath)
-	if err != nil || st.Mode().Perm() != 0o644 {
-		t.Fatalf("expected .claude.json perm 0644 preserved, got %v err=%v", st.Mode().Perm(), err)
+	if err != nil {
+		t.Fatalf("expected .claude.json to exist: %v", err)
+	}
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o644 {
+		t.Fatalf("expected .claude.json perm 0644 preserved, got %v", st.Mode().Perm())
 	}
 
 	// Enable usage for Claude and fetch both slots (slot 2 should refresh token).

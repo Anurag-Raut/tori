@@ -109,9 +109,11 @@ func isValidClaudeKeychainUser(u string) bool {
 
 func (c *Claude) keychainUsers(env *Env) []string {
 	u := env.getenv("USER")
-	if u == "" && env.Environ == nil {
-		if cur, err := user.Current(); err == nil {
-			u = cur.Username
+	if u == "" {
+		if _, isOS := env.Keyring.(osKeyring); isOS || env.Environ == nil {
+			if cur, err := user.Current(); err == nil {
+				u = cur.Username
+			}
 		}
 	}
 	if isValidClaudeKeychainUser(u) && u != claudeKeychainFallbackUsr {

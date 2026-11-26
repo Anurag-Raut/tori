@@ -7,10 +7,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 
 const TARGETS = [
-  { pkg: "tori-cli-linux-x64", os: "linux", cpu: "x64", goos: "linux", goarch: "amd64" },
-  { pkg: "tori-cli-linux-arm64", os: "linux", cpu: "arm64", goos: "linux", goarch: "arm64" },
-  { pkg: "tori-cli-darwin-x64", os: "darwin", cpu: "x64", goos: "darwin", goarch: "amd64" },
-  { pkg: "tori-cli-darwin-arm64", os: "darwin", cpu: "arm64", goos: "darwin", goarch: "arm64" },
+  { pkg: "tori-cli-linux-x64", os: "linux", cpu: "x64", goos: "linux", goarch: "amd64", bin: "tori" },
+  { pkg: "tori-cli-linux-arm64", os: "linux", cpu: "arm64", goos: "linux", goarch: "arm64", bin: "tori" },
+  { pkg: "tori-cli-darwin-x64", os: "darwin", cpu: "x64", goos: "darwin", goarch: "amd64", bin: "tori" },
+  { pkg: "tori-cli-darwin-arm64", os: "darwin", cpu: "arm64", goos: "darwin", goarch: "arm64", bin: "tori" },
+  { pkg: "tori-cli-win32-x64", os: "win32", cpu: "x64", goos: "windows", goarch: "amd64", bin: "tori.exe" },
+  { pkg: "tori-cli-win32-arm64", os: "win32", cpu: "arm64", goos: "windows", goarch: "arm64", bin: "tori.exe" },
 ];
 
 function parseArgs(argv) {
@@ -37,19 +39,19 @@ function parseArgs(argv) {
   return opts;
 }
 
-function findBinary(distDir, goos, goarch) {
+function findBinary(distDir, goos, goarch, binName) {
   const prefix = `tori_${goos}_${goarch}`;
   const entries = fs.readdirSync(distDir, { withFileTypes: true });
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     if (entry.name === prefix || entry.name.startsWith(`${prefix}_`)) {
-      const candidate = path.join(distDir, entry.name, "tori");
+      const candidate = path.join(distDir, entry.name, binName);
       if (fs.existsSync(candidate)) {
         return candidate;
       }
     }
   }
-  throw new Error(`missing GoReleaser binary for ${goos}/${goarch} under ${distDir}`);
+  throw new Error(`missing GoReleaser binary for ${goos}/${goarch} (${binName}) under ${distDir}`);
 }
 
 function main() {
@@ -64,14 +66,16 @@ function main() {
 
   // 1. Stage each platform binary package.
   for (const t of TARGETS) {
-    const binSrc = findBinary(dist, t.goos, t.goarch);
+    const binSrc = findBinary(dist, t.goos, t.goarch, t.bin);
     const pkgDir = path.join(out, t.pkg);
     const binDir = path.join(pkgDir, "bin");
     fs.mkdirSync(binDir, { recursive: true });
 
-    const binDst = path.join(binDir, "tori");
+    const binDst = path.join(binDir, t.bin);
     fs.copyFileSync(binSrc, binDst);
-    fs.chmodSync(binDst, 0o755);
+    if (t.os !== "win32") {
+      fs.chmodSync(binDst, 0o755);
+    }
     fs.copyFileSync(licensePath, path.join(pkgDir, "LICENSE"));
 
     const manifest = {
@@ -84,7 +88,7 @@ function main() {
       bugs: mainPkg.bugs,
       os: [t.os],
       cpu: [t.cpu],
-      files: ["bin/tori", "LICENSE"],
+      files: [`bin/${t.bin}`, "LICENSE"],
     };
     fs.writeFileSync(
       path.join(pkgDir, "package.json"),

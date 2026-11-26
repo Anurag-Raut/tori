@@ -95,11 +95,11 @@ The alias is optional — Tori reads the email directly from native logins (and 
 
 ### Platform support
 
-| Tool | Linux | macOS | Notes |
-|---|---|---|---|
-| **Claude Code** | Supported | Supported | Supports `.credentials.json`, macOS Keychain (`Claude Code-credentials`), `CLAUDE_CONFIG_DIR`, and `CLAUDE_SECURESTORAGE_CONFIG_DIR` |
-| **Codex CLI** | Supported | Supported | Supports ChatGPT OAuth & API keys, `auth.json`, and OS keyring (`Codex Auth` via `cli_auth_credentials_store`) |
-| **Antigravity** | Supported | Supported | Supports Desktop/Classic & IDE (`state.vscdb`), CLI `agy` & Desktop 2.x (OS keyring + token files), and T3 Code (`acp_token.json` / `antigravity-oauth-token`) |
+| Tool | Linux | macOS | Windows | Notes |
+|---|---|---|---|---|
+| **Claude Code** | Supported | Supported | Supported | `.credentials.json` (Linux/Windows), macOS Keychain (`Claude Code-credentials`), `CLAUDE_CONFIG_DIR`, and `CLAUDE_SECURESTORAGE_CONFIG_DIR` |
+| **Codex CLI** | Supported | Supported | Supported | ChatGPT OAuth & API keys, `auth.json`, and OS keyring (`Codex Auth` via `cli_auth_credentials_store`) |
+| **Antigravity** | Supported | Supported | Supported | Desktop/Classic & IDE (`state.vscdb`), CLI `agy` & Desktop 2.x (OS keyring + token files), and T3 Code (`acp_token.json` / `antigravity-oauth-token`) |
 
 ## Reading the quota bars
 

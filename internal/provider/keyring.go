@@ -81,3 +81,49 @@ func buildSecurityAddCommand(service, user, secret string) string {
 		hex.EncodeToString([]byte(secret)),
 	)
 }
+
+// windowsCredTargetNames returns Windows Credential Manager target names in preferred order.
+// Rust's keyring crate (used by Codex) stores "<user>.<service>", while Go's go-keyring
+// (used by Go CLI tools) stores "<service>:<user>".
+func windowsCredTargetNames(service, user string) []string {
+	rustStyle := user + "." + service
+	goStyle := service + ":" + user
+	if service == codexKeyringService {
+		return []string{rustStyle, goStyle}
+	}
+	return []string{goStyle, rustStyle}
+}
+
+// decodeWindowsCredBlob decodes raw Windows Credential Manager bytes, handling both
+// plain UTF-8 (go-keyring / wincred) and UTF-16LE (some native Windows / Rust entries).
+func decodeWindowsCredBlob(blob []byte) string {
+	if len(blob) >= 2 && len(blob)%2 == 0 {
+		// Detect UTF-16LE ASCII/JSON (every odd byte is NUL in ASCII prefix).
+		nulOdd := 0
+		check := len(blob)
+		if check > 32 {
+			check = 32
+		}
+		for i := 1; i < check; i += 2 {
+			if blob[i] == 0 {
+				nulOdd++
+			}
+		}
+		if nulOdd > 0 && nulOdd >= (check/2)-2 && blob[0] != 0 {
+			u16 := make([]uint16, len(blob)/2)
+			for i := range u16 {
+				u16[i] = uint16(blob[2*i]) | uint16(blob[2*i+1])<<8
+			}
+			// Trim trailing NUL if present.
+			for len(u16) > 0 && u16[len(u16)-1] == 0 {
+				u16 = u16[:len(u16)-1]
+			}
+			var b strings.Builder
+			for _, r := range u16 {
+				b.WriteRune(rune(r))
+			}
+			return b.String()
+		}
+	}
+	return string(blob)
+}

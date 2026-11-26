@@ -34,7 +34,8 @@
   },
   "os": [
     "linux",
-    "darwin"
+    "darwin",
+    "win32"
   ],
   "cpu": [
     "x64",
@@ -44,6 +45,8 @@
     "tori-cli-linux-x64": "0.0.0",
     "tori-cli-linux-arm64": "0.0.0",
     "tori-cli-darwin-x64": "0.0.0",
-    "tori-cli-darwin-arm64": "0.0.0"
+    "tori-cli-darwin-arm64": "0.0.0",
+    "tori-cli-win32-x64": "0.0.0",
+    "tori-cli-win32-arm64": "0.0.0"
   }
 }
