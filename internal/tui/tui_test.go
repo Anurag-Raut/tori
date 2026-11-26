@@ -222,7 +222,7 @@ func assertGolden(t *testing.T, name, got string) {
 	if err != nil {
 		t.Fatalf("missing golden %s (run with -update to create): %v", path, err)
 	}
-	want := string(wantBytes)
+	want := strings.ReplaceAll(string(wantBytes), "\r\n", "\n")
 	if got != want {
 		t.Fatalf("golden mismatch for %s\n--- WANT ---\n%s\n--- GOT ---\n%s", name, want, got)
 	}
