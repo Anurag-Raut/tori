@@ -48,14 +48,18 @@ func barState(leftPct float64) barLevel {
 // at least 1 cell; 100% fills all cells; 0% fills none.
 //
 // timeLeft is the share of the window still ahead in [0, 1], or negative when
-// no pace line should be drawn (e.g. no reading yet). When >= 0, one cell at
-// round(timeLeft * (width-1)) is replaced by cellPace so the line stays visible
-// even when it lands on a filled cell.
+// no pace line should be drawn (e.g. window not started or no reading yet).
+// When >= 0, one cell is replaced by cellPace using center-aligned mapping
+// floor(timeLeft * width), clamped to [0, width-1]. When quota left and time
+// left diverge by at least 4%, the adjacent cell boundary is adjusted by at
+// most 1 cell (choosing the minimal-error shift) so surplus fill past the pace
+// line or a track gap before it remains visible even on compact bars.
 func barCells(leftPct, timeLeft float64, width int) []barCellKind {
 	if width <= 0 {
 		return nil
 	}
 	leftPct = math.Max(0, math.Min(100, leftPct))
+	leftFrac := leftPct / 100.0
 
 	filled := 0
 	switch {
@@ -64,7 +68,7 @@ func barCells(leftPct, timeLeft float64, width int) []barCellKind {
 	case leftPct >= 100:
 		filled = width
 	default:
-		filled = int(math.Round(leftPct / 100.0 * float64(width)))
+		filled = int(math.Round(leftFrac * float64(width)))
 		if filled < 1 {
 			filled = 1
 		}
@@ -73,21 +77,86 @@ func barCells(leftPct, timeLeft float64, width int) []barCellKind {
 		}
 	}
 
+	paceIdx := -1
+	if timeLeft >= 0 {
+		clamped := math.Max(0, math.Min(1, timeLeft))
+		paceIdx = int(math.Floor(clamped * float64(width)))
+		if paceIdx < 0 {
+			paceIdx = 0
+		}
+		if paceIdx >= width {
+			paceIdx = width - 1
+		}
+
+		const sepThreshold = 0.04
+		diff := leftFrac - clamped
+		w := float64(width)
+		if diff >= sepThreshold && filled <= paceIdx+1 && width >= 2 {
+			// Ahead of pace: ensure at least 1 filled cell appears past paceIdx.
+			bestCost := math.Inf(1)
+			bestFilled, bestPace := filled, paceIdx
+			if paceIdx > 0 {
+				np := paceIdx - 1
+				nf := filled
+				if nf < np+2 {
+					nf = np + 2
+				}
+				if nf <= width {
+					cost := math.Abs((float64(np)+0.5)/w-clamped) + math.Abs(float64(nf)/w-leftFrac)
+					if cost < bestCost {
+						bestCost, bestFilled, bestPace = cost, nf, np
+					}
+				}
+			}
+			if paceIdx+2 <= width {
+				nf := paceIdx + 2
+				cost := math.Abs((float64(paceIdx)+0.5)/w-clamped) + math.Abs(float64(nf)/w-leftFrac)
+				if cost < bestCost {
+					bestCost, bestFilled, bestPace = cost, nf, paceIdx
+				}
+			}
+			filled, paceIdx = bestFilled, bestPace
+		} else if diff <= -sepThreshold && filled >= paceIdx && width >= 2 {
+			// Behind pace: ensure at least 1 track cell separates fill from paceIdx.
+			minFilled := 0
+			if leftPct > 0 {
+				minFilled = 1
+			}
+			bestCost := math.Inf(1)
+			bestFilled, bestPace := filled, paceIdx
+			if paceIdx-1 >= minFilled {
+				nf := paceIdx - 1
+				cost := math.Abs((float64(paceIdx)+0.5)/w-clamped) + math.Abs(float64(nf)/w-leftFrac)
+				if cost < bestCost {
+					bestCost, bestFilled, bestPace = cost, nf, paceIdx
+				}
+			}
+			np := paceIdx + 1
+			if np < minFilled+1 {
+				np = minFilled + 1
+			}
+			if np < width {
+				nf := filled
+				if nf > np-1 {
+					nf = np - 1
+				}
+				if nf >= minFilled {
+					cost := math.Abs((float64(np)+0.5)/w-clamped) + math.Abs(float64(nf)/w-leftFrac)
+					if cost < bestCost {
+						bestCost, bestFilled, bestPace = cost, nf, np
+					}
+				}
+			}
+			filled, paceIdx = bestFilled, bestPace
+		}
+	}
+
 	cells := make([]barCellKind, width)
 	for i := 0; i < filled; i++ {
 		cells[i] = cellFill
 	}
-
-	if timeLeft >= 0 {
-		clamped := math.Max(0, math.Min(1, timeLeft))
-		idx := int(math.Round(clamped * float64(width-1)))
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= width {
-			idx = width - 1
-		}
-		cells[idx] = cellPace
+	if paceIdx >= 0 {
+		cells[paceIdx] = cellPace
 	}
 	return cells
 }

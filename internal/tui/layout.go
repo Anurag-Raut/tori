@@ -94,13 +94,21 @@ func computeWideColumns(rowW, numWindows int) wideColumns {
 		baseAlias = 9
 		basePlan  = 5
 		winGap    = 2
-		winFixed  = 3 + 1 + 4 + 2 + 6 // label(3) + gap(1) + pct(4) + flag(2) + reset(6) = 16
+		winFixed  = 4 + 1 + 4 + 2 + 6 // label(4) + gap(1) + pct(4) + flag(2) + reset(6) = 17
 	)
 	overhead := leftPad + dotW + slotW + rightPad // 6
 
 	if numWindows <= 2 {
 		barW := 10
-		winW := winFixed + barW // 26
+		minForBase := overhead + baseEmail + baseAlias + basePlan + 2*(winFixed+barW) + winGap
+		if extra := rowW - minForBase; extra >= 2 {
+			add := extra / 2
+			if add > 4 {
+				add = 4
+			}
+			barW += add
+		}
+		winW := winFixed + barW
 		winAreaW := 2*winW + winGap
 		emailW := rowW - overhead - baseAlias - basePlan - winAreaW
 		if emailW < minEmail {

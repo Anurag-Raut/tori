@@ -177,11 +177,6 @@ func buildWindowViews(u *provider.UsageInfo, now time.Time) []windowView {
 			if winDur, ok := windowDuration(w.Label); ok && winDur > 0 {
 				v.timeLeft = math.Max(0, math.Min(1, rem.Seconds()/winDur.Seconds()))
 			}
-		} else if left >= 100 {
-			// Window not started (100% left, no reset time yet):
-			// the whole window is still ahead, so pace line sits at the far right
-			// and the reset column stays blank.
-			v.timeLeft = 1.0
 		}
 		out = append(out, v)
 	}
