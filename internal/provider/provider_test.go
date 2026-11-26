@@ -191,10 +191,10 @@ func TestClaudeLifecycleAndUsage(t *testing.T) {
 	env, _ := newTestEnv(t, rt)
 	c := &Claude{}
 
-	// macOS Keychain hint when not logged in.
+	// Clean machine without claude installed reports not installed cleanly.
 	env.GOOS = "darwin"
-	if _, err := c.Add(env, nil); err == nil || !strings.Contains(err.Error(), "Keychain") {
-		t.Fatalf("expected darwin Keychain error, got %v", err)
+	if _, err := c.Add(env, nil); err == nil || !strings.Contains(err.Error(), "not installed") {
+		t.Fatalf("expected not-installed error on clean machine, got %v", err)
 	}
 	env.GOOS = "linux"
 

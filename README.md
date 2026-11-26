@@ -97,8 +97,8 @@ The alias is optional — Tori reads the email directly from native logins (and 
 
 | Tool | Linux | macOS | Notes |
 |---|---|---|---|
-| **Claude Code** | Supported | Not yet | macOS stores Claude logins in Keychain rather than `~/.claude/.credentials.json` |
-| **Codex CLI** | Supported | Supported | Supports both ChatGPT OAuth and API-key logins |
+| **Claude Code** | Supported | Supported | Supports `.credentials.json`, macOS Keychain (`Claude Code-credentials`), `CLAUDE_CONFIG_DIR`, and `CLAUDE_SECURESTORAGE_CONFIG_DIR` |
+| **Codex CLI** | Supported | Supported | Supports ChatGPT OAuth & API keys, `auth.json`, and OS keyring (`Codex Auth` via `cli_auth_credentials_store`) |
 | **Antigravity** | Supported | Supported | Supports Desktop/Classic & IDE (`state.vscdb`), CLI `agy` & Desktop 2.x (OS keyring + token files), and T3 Code (`acp_token.json` / `antigravity-oauth-token`) |
 
 ## Reading the quota bars
@@ -161,7 +161,7 @@ Preferences live in `~/.tori/config.json` and saved credentials under `~/.tori/{
 | `TORI_ASCII=1` | Use plain ASCII glyphs (same as `tori --ascii`; auto-enabled on `TERM=linux`) |
 | `TORI_NO_ANIM=1` | Disable spinner animation |
 | `NO_COLOR=1` | Monochrome output |
-| `CLAUDE_CONFIG_DIR`, `TORI_CLAUDE_CREDS`, `TORI_CLAUDE_CONFIG` | Override Claude Code credential/config paths |
+| `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `TORI_CLAUDE_CREDS`, `TORI_CLAUDE_CONFIG` | Override Claude Code credential/config paths |
 | `CODEX_HOME`, `TORI_CODEX_AUTH` | Override Codex CLI auth path |
 | `TORI_AGY_TOKEN`, `TORI_AGY_DESKTOP_DB`, `TORI_AGY_IDE_DB`, `TORI_AGY_CLI_TOKEN`, `TORI_AGY_DESKTOP_TOKEN` | Override Antigravity token or `state.vscdb` paths |
 
