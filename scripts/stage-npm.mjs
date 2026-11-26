@@ -54,7 +54,7 @@ function findBinary(distDir, goos, goarch) {
 
 function main() {
   const { version, dist, out } = parseArgs(process.argv.slice(2));
-  const templateDir = path.join(repoRoot, "npm", "tori-cli");
+  const templateDir = path.join(repoRoot, "npm", "tori-switch");
   const mainPkg = JSON.parse(fs.readFileSync(path.join(templateDir, "package.json"), "utf8"));
   const licensePath = path.join(repoRoot, "LICENSE");
   const readmePath = path.join(repoRoot, "README.md");
@@ -92,7 +92,7 @@ function main() {
     );
   }
 
-  // 2. Stage the main tori-cli wrapper package.
+  // 2. Stage the main wrapper package.
   const mainOut = path.join(out, mainPkg.name);
   fs.mkdirSync(path.join(mainOut, "bin"), { recursive: true });
 
@@ -122,7 +122,7 @@ function main() {
     `${JSON.stringify(mainPkg, null, 2)}\n`
   );
 
-  console.log(`Staged ${TARGETS.length + 1} npm packages for tori-cli@${version} in ${out}`);
+  console.log(`Staged ${TARGETS.length + 1} npm packages for ${mainPkg.name}@${version} in ${out}`);
 }
 
 main();

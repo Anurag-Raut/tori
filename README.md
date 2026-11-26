@@ -25,13 +25,13 @@
 ### npm
 
 ```bash
-npm install -g tori-cli
+npm install -g tori-switch
 ```
 
 Or run without installing globally:
 
 ```bash
-npx tori-cli
+npx tori-switch
 ```
 
 ### Quick install (Linux & macOS)

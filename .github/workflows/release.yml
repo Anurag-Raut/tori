@@ -38,7 +38,7 @@ jobs:
             dist/npm/tori-cli-linux-arm64 \
             dist/npm/tori-cli-darwin-x64 \
             dist/npm/tori-cli-darwin-arm64 \
-            dist/npm/tori-cli
+            dist/npm/tori-switch
           do
             echo "Publishing $dir..."
             (cd "$dir" && npm publish --access public)
