@@ -1,0 +1,394 @@
+package tui
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Anurag-Raut/tori/internal/config"
+	"github.com/Anurag-Raut/tori/internal/provider"
+)
+
+type dialogKind int
+
+const (
+	dialogNone dialogKind = iota
+	dialogAddPickTool
+	dialogAddSignIn
+	dialogAddAlreadySaved
+	dialogAddSave
+	dialogRemove
+	dialogMetersOn
+	dialogHelp
+)
+
+type dialogChoice struct {
+	id          string
+	label       string
+	toolIconKey string // non-empty for provider tool picker choices
+	destructive bool
+}
+
+type dialogHit struct {
+	id     string
+	x0, x1 int
+	y      int
+}
+
+type dialogRect struct {
+	x0, y0, x1, y1 int
+}
+
+// dialogState tracks active modal dialog state.
+type dialogState struct {
+	kind           dialogKind
+	provider       provider.Provider
+	account        *provider.AccountEntry
+	otherSlot      int // target slot for "Switch to slot N, then remove"
+	onlyAccount    bool
+	status         provider.StatusInfo
+	initialSlot    *int // slot signed in when Add step 2 opened
+	stillSameLogin bool // true after a re-check finds the same saved account
+	cursor         int  // index in current dialog choices
+	hoverIdx       int  // hovered choice index, -1 if none
+}
+
+func (d *dialogState) close() {
+	*d = dialogState{hoverIdx: -1}
+}
+
+// dialogChoices returns the selectable choice list for the active dialog.
+func (m Model) dialogChoices() []dialogChoice {
+	switch m.dlg.kind {
+	case dialogAddPickTool:
+		out := make([]dialogChoice, 0, len(m.providers))
+		for _, p := range m.providers {
+			out = append(out, dialogChoice{
+				id:          "tool:" + p.Key(),
+				label:       p.Title(),
+				toolIconKey: p.Key(),
+			})
+		}
+		return out
+
+	case dialogAddAlreadySaved:
+		slotN := 0
+		if m.dlg.status.ManagedSlot != nil {
+			slotN = *m.dlg.status.ManagedSlot
+		}
+		return []dialogChoice{
+			{id: "update", label: fmt.Sprintf("Update slot %d with this login", slotN)},
+			{id: "cancel", label: "Cancel"},
+		}
+
+	case dialogRemove:
+		if m.dlg.account == nil {
+			return nil
+		}
+		if !m.dlg.account.Active {
+			// Not in use: Cancel is default (index 0).
+			return []dialogChoice{
+				{id: "cancel", label: "Cancel"},
+				{id: "remove", label: "Remove", destructive: true},
+			}
+		}
+		if !m.dlg.onlyAccount && m.dlg.otherSlot > 0 {
+			// In use, other accounts exist: Switch then remove is default (index 0).
+			return []dialogChoice{
+				{id: "switch_remove", label: fmt.Sprintf("Switch to slot %d, then remove", m.dlg.otherSlot)},
+				{id: "remove", label: "Remove only", destructive: true},
+				{id: "cancel", label: "Cancel"},
+			}
+		}
+		// Only account: Cancel is default (index 2). Destructive choices are never default.
+		return []dialogChoice{
+			{id: "remove", label: "Remove only", destructive: true},
+			{id: "remove_clear", label: "Remove and clear login", destructive: true},
+			{id: "cancel", label: "Cancel"},
+		}
+
+	case dialogMetersOn:
+		if m.dlg.provider != nil && m.dlg.provider.Key() == "antigravity" {
+			// Antigravity: Not now is default (index 0).
+			return []dialogChoice{
+				{id: "cancel", label: "Not now"},
+				{id: "enable", label: "I understand, turn on"},
+			}
+		}
+		// Standard disclaimer: Turn on is default (index 0).
+		return []dialogChoice{
+			{id: "enable", label: "Turn on"},
+			{id: "cancel", label: "Not now"},
+		}
+	}
+	return nil
+}
+
+// buildDialog renders the active dialog box, its screen-space choice hit targets,
+// and its outer bounding rectangle (within the screen below the header).
+func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
+	innerW := 44
+	maxBoxW := max(26, m.layout.termW-4)
+	if innerW+6 > maxBoxW {
+		innerW = max(20, maxBoxW-6)
+	}
+
+	var lines []string
+	type relHit struct {
+		id   string
+		line int
+	}
+	var relHits []relHit
+
+	addWrapped := func(text string, st lipgloss.Style) {
+		for _, ln := range wrapPlain(text, innerW) {
+			lines = append(lines, st.Render(ln))
+		}
+	}
+
+	addWrappedPrefix := func(prefix, text string, st lipgloss.Style) {
+		pW := lipgloss.Width(prefix)
+		bodyW := max(10, innerW-pW)
+		indent := strings.Repeat(" ", pW)
+		for i, ln := range wrapPlain(text, bodyW) {
+			if i == 0 {
+				lines = append(lines, st.Render(prefix+ln))
+			} else {
+				lines = append(lines, st.Render(indent+ln))
+			}
+		}
+	}
+
+	renderChoices := func(choices []dialogChoice) {
+		for i, c := range choices {
+			selected := i == m.dlg.cursor
+			hovered := !selected && i == m.dlg.hoverIdx
+			relHits = append(relHits, relHit{id: c.id, line: len(lines)})
+			lines = append(lines, m.renderDialogChoice(c, innerW, selected, hovered))
+		}
+	}
+
+	renderHint := func(pairs ...string) string {
+		// pairs are alternating key, desc
+		parts := make([]string, 0, len(pairs)/2)
+		for i := 0; i+1 < len(pairs); i += 2 {
+			parts = append(parts, m.theme.key.Render(pairs[i])+" "+m.theme.dim.Render(pairs[i+1]))
+		}
+		return strings.Join(parts, " "+m.theme.dim.Render(m.glyphs.sep)+" ")
+	}
+
+	hintLine := ""
+
+	switch m.dlg.kind {
+	case dialogAddPickTool:
+		lines = append(lines, m.theme.dialogTitle.Render("Add account"))
+		lines = append(lines, "")
+		renderChoices(m.dialogChoices())
+		hintLine = renderHint(m.glyphs.keyEnter, "choose", "esc", "cancel")
+
+	case dialogAddSignIn:
+		title := "Add account"
+		toolName := "the tool"
+		if m.dlg.provider != nil {
+			toolName = m.dlg.provider.Title()
+			title = fmt.Sprintf("Add %s account", toolName)
+		}
+		lines = append(lines, m.theme.dialogTitle.Render(title))
+		lines = append(lines, "")
+		addWrappedPrefix("1  ", fmt.Sprintf("Sign in to %s with the account you want to add.", toolName), m.theme.text)
+		addWrappedPrefix("2  ", fmt.Sprintf("Come back here and press %s.", m.glyphs.keyEnter), m.theme.text)
+		if m.dlg.stillSameLogin {
+			lines = append(lines, "")
+			addWrappedPrefix(m.glyphs.warn+" ", "Still signed in as the saved account.", m.theme.warn)
+			addWrappedPrefix("  ", "Sign in with a different one.", m.theme.dim)
+		}
+		hintLine = renderHint(m.glyphs.keyEnter, "check again", "esc", "cancel")
+
+	case dialogAddAlreadySaved:
+		lines = append(lines, m.theme.dialogTitle.Render("Already saved"))
+		lines = append(lines, "")
+		slotN := 0
+		if m.dlg.status.ManagedSlot != nil {
+			slotN = *m.dlg.status.ManagedSlot
+		}
+		email := m.dlg.status.DisplayName
+		if email == "" {
+			email = "This account"
+		}
+		addWrapped(fmt.Sprintf("%s is slot %d.", email, slotN), m.theme.text)
+		lines = append(lines, "")
+		renderChoices(m.dialogChoices())
+		hintLine = renderHint(m.glyphs.keyEnter, "choose", "esc", "cancel")
+
+	case dialogAddSave:
+		lines = append(lines, m.theme.dialogTitle.Render("Save account"))
+		lines = append(lines, "")
+		email := m.dlg.status.DisplayName
+		if email == "" {
+			email = "Signed-in account"
+		}
+		lines = append(lines, m.theme.text.Render(fitCell(email, innerW, false)))
+		sub := ""
+		if m.dlg.provider != nil {
+			sub = m.dlg.provider.Title()
+		}
+		if m.dlg.status.Plan != "" {
+			sub += " " + m.glyphs.sep + " " + m.dlg.status.Plan
+		} else if m.dlg.account != nil {
+			if pl := planLabel(*m.dlg.account); pl != "" {
+				sub += " " + m.glyphs.sep + " " + pl
+			}
+		}
+		if sub != "" {
+			lines = append(lines, m.theme.dim.Render(fitCell(sub, innerW, false)))
+		}
+		lines = append(lines, "")
+		lines = append(lines, m.theme.dim.Render("Alias ")+m.aliasInput.View())
+		hintLine = renderHint(m.glyphs.keyEnter, "save", "esc", "cancel")
+
+	case dialogRemove:
+		if m.dlg.account == nil {
+			return "", nil, dialogRect{}
+		}
+		acct := *m.dlg.account
+		switch {
+		case !acct.Active:
+			lines = append(lines, m.theme.dialogTitle.Render("Remove account?"))
+			lines = append(lines, "")
+			lines = append(lines, m.theme.text.Render(fitCell(acct.Email, innerW, false)))
+			metaBits := []string{fmt.Sprintf("Slot %d", acct.Number)}
+			if acct.Alias != nil && *acct.Alias != "" {
+				metaBits = append(metaBits, *acct.Alias)
+			}
+			if pl := planLabel(acct); pl != "" {
+				metaBits = append(metaBits, pl)
+			}
+			lines = append(lines, m.theme.dim.Render(fitCell(strings.Join(metaBits, " "+m.glyphs.sep+" "), innerW, false)))
+		case !m.dlg.onlyAccount && m.dlg.otherSlot > 0:
+			lines = append(lines, m.theme.dialogTitle.Render("Remove the account in use?"))
+			lines = append(lines, "")
+			lines = append(lines, m.theme.text.Render(fitCell(acct.Email, innerW, false)))
+		default:
+			toolName := ""
+			if m.dlg.provider != nil {
+				toolName = m.dlg.provider.Title()
+			}
+			lines = append(lines, m.theme.dialogTitle.Render(fmt.Sprintf("Remove your only %s account?", toolName)))
+			lines = append(lines, "")
+			lines = append(lines, m.theme.text.Render(fitCell(acct.Email, innerW, false)))
+		}
+		lines = append(lines, "")
+		renderChoices(m.dialogChoices())
+		hintLine = renderHint(m.glyphs.keyEnter, "choose", "esc", "cancel")
+
+	case dialogMetersOn:
+		toolName := ""
+		toolKey := ""
+		if m.dlg.provider != nil {
+			toolName = m.dlg.provider.Title()
+			toolKey = m.dlg.provider.Key()
+		}
+		lines = append(lines, m.theme.dialogTitle.Render(fmt.Sprintf("Turn on meters for %s?", toolName)))
+		lines = append(lines, "")
+		if warnText, hasExtra := config.DisclaimerTool[toolKey]; hasExtra {
+			addWrappedPrefix(m.glyphs.warn+" ", warnText, m.theme.warn)
+			lines = append(lines, "")
+			addWrapped(config.DisclaimerTail, m.theme.dim)
+		} else {
+			addWrapped(config.DisclaimerHead+" "+config.DisclaimerTail, m.theme.dim)
+		}
+		lines = append(lines, "")
+		renderChoices(m.dialogChoices())
+		hintLine = renderHint(m.glyphs.keyEnter, "choose", "esc", "cancel")
+
+	case dialogHelp:
+		lines = append(lines, m.theme.dialogTitle.Render("Keys"))
+		lines = append(lines, "")
+		moveKey := m.glyphs.keyMove + " / j k"
+		if m.glyphs.ascii {
+			moveKey = "up/dn / j k"
+		}
+		items := []struct{ k, d string }{
+			{moveKey, "Move selection"},
+			{m.glyphs.keyEnter, "Switch account"},
+			{m.glyphs.keyTab, "Jump to next tool"},
+			{"a", "Add account"},
+			{"d", "Remove account"},
+			{"u", "Toggle meters for tool"},
+			{"b", "Rotate all tools"},
+			{"r", "Refresh usage now"},
+			{"q", "Quit"},
+		}
+		for _, it := range items {
+			lines = append(lines, m.theme.key.Render(fitCell(it.k, 12, false))+m.theme.dim.Render(it.d))
+		}
+		lines = append(lines, "")
+		addWrapped(fmt.Sprintf("bar = quota left %s %s = time until reset", m.glyphs.sep, m.glyphs.pace), m.theme.dim)
+		hintLine = renderHint("esc", "close")
+
+	default:
+		return "", nil, dialogRect{}
+	}
+
+	if hintLine != "" {
+		lines = append(lines, "", hintLine)
+	}
+
+	content := strings.Join(lines, "\n")
+	box := m.theme.dialogBox.Render(content)
+
+	boxW := lipgloss.Width(box)
+	boxH := lipgloss.Height(box)
+	placeH := max(1, m.layout.termH-2)
+	leftX := max(0, (m.layout.termW-boxW)/2)
+	topY := 2 + max(0, (placeH-boxH)/2) // header (1) + blank (1)
+
+	// Border (1) + Padding(1, 2) => inner content starts at (+3, +2).
+	innerX := leftX + 3
+	innerY := topY + 2
+	hits := make([]dialogHit, 0, len(relHits))
+	for _, rh := range relHits {
+		hits = append(hits, dialogHit{
+			id: rh.id,
+			x0: innerX,
+			x1: innerX + innerW,
+			y:  innerY + rh.line,
+		})
+	}
+	rect := dialogRect{
+		x0: leftX,
+		y0: topY,
+		x1: leftX + boxW,
+		y1: topY + boxH,
+	}
+	return box, hits, rect
+}
+
+func (m Model) renderDialogChoice(c dialogChoice, innerW int, selected, hovered bool) string {
+	var st lipgloss.Style
+	switch {
+	case c.destructive && selected:
+		st = m.theme.dialogChoiceBadSel
+	case c.destructive && hovered:
+		st = m.theme.dialogChoiceBadHover
+	case c.destructive:
+		st = m.theme.dialogChoiceBad
+	case selected:
+		st = m.theme.dialogChoiceSel
+	case hovered:
+		st = m.theme.dialogChoiceHover
+	default:
+		st = m.theme.dialogChoice
+	}
+
+	if c.toolIconKey != "" {
+		icon := m.glyphs.toolIcon(c.toolIconKey)
+		iconSt := m.theme.toolStyleOnBg(c.toolIconKey, selected, hovered)
+		iconW := lipgloss.Width(icon)
+		restW := max(0, innerW-1-iconW-1)
+		return st.Render(" ") + iconSt.Render(icon) + st.Render(" "+fitCell(c.label, restW, false))
+	}
+
+	return st.Render(" " + fitCell(c.label, max(0, innerW-1), false))
+}

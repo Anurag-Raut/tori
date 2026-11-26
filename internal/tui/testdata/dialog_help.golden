@@ -1,0 +1,22 @@
+ tori
+
+       +-------------------------------------------+        
+       |                                           |        
+       |  Keys                                     |        
+       |                                           |        
+       |  up/dn / j k Move selection               |        
+       |  enter       Switch account               |        
+       |  tab         Jump to next tool            |        
+       |  a           Add account                  |        
+       |  d           Remove account               |        
+       |  u           Toggle meters for tool       |        
+       |  b           Rotate all tools             |        
+       |  r           Refresh usage now            |        
+       |  q           Quit                         |        
+       |                                           |        
+       |  bar = quota left - | = time until reset  |        
+       |                                           |        
+       |  esc close                                |        
+       |                                           |        
+       +-------------------------------------------+        
+                                                            

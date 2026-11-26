@@ -224,6 +224,7 @@ func (c *Claude) Status(env *Env) (StatusInfo, error) {
 	return StatusInfo{
 		LoggedIn:    true,
 		DisplayName: email,
+		Plan:        c.planLabel(oauth),
 		ManagedSlot: cur,
 	}, nil
 }

@@ -231,7 +231,7 @@ func (x *Codex) Status(env *Env) (StatusInfo, error) {
 	}
 	accts, _ := x.Slots(env)
 	cur := x.Current(env, accts)
-	_, email, _ := x.identity(live)
+	_, email, plan := x.identity(live)
 	display := email
 	if display == "" {
 		if x.isAPIKey(live) {
@@ -240,9 +240,13 @@ func (x *Codex) Status(env *Env) (StatusInfo, error) {
 			display = "(unknown email)"
 		}
 	}
+	if plan == "API key" {
+		plan = "API"
+	}
 	return StatusInfo{
 		LoggedIn:    true,
 		DisplayName: display,
+		Plan:        plan,
 		ManagedSlot: cur,
 	}, nil
 }

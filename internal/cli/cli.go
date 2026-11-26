@@ -18,9 +18,9 @@ import (
 
 const usageText = `usage: tori [command] [args]
 
-  tori                      interactive picker (enter switch, a add, d remove, u usage)
+  tori [--ascii]            interactive picker (enter switch, a add, d remove, u meters)
   tori list                 list accounts for every tool (--no-usage, --refresh, --json)
-  tori usage                show usage meters on/off per tool (off by default)
+  tori usage                show usage meters on/off per tool (on by default)
   tori usage on|off <c|x|g|all> [--yes]   turn meters on (shows a disclaimer first) or off
   tori status               show the current account for each tool
   tori switch               rotate every tool to its next account
@@ -83,6 +83,13 @@ func Run(env *provider.Env, args []string, version string, ioCfg IO, runTUI func
 	}
 	for _, w := range warnings {
 		env.Warn(w)
+	}
+
+	if hasFlag(args, "--ascii") {
+		cloned := *env
+		cloned.ASCII = true
+		env = &cloned
+		args = filterFlags(args, "--ascii")
 	}
 
 	if len(args) == 0 {

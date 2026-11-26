@@ -78,6 +78,21 @@ func TestVersionHelpAndNonTTYRoot(t *testing.T) {
 	if rc != 2 || !strings.Contains(errOut, "interactive mode needs a terminal") {
 		t.Fatalf("expected rc=2 for non-TTY root, got rc=%d err=%q", rc, errOut)
 	}
+
+	// --ascii passes ASCII=true into TUI launcher.
+	var gotASCII bool
+	rc = Run(env, []string{"--ascii"}, "1.2.3", IO{
+		Stdin:  strings.NewReader(""),
+		Stdout: &bytes.Buffer{},
+		Stderr: &bytes.Buffer{},
+		IsTTY:  true,
+	}, func(e *provider.Env) int {
+		gotASCII = e.ASCII
+		return 0
+	})
+	if rc != 0 || !gotASCII {
+		t.Fatalf("expected --ascii to launch TUI with ASCII=true, got rc=%d ascii=%v", rc, gotASCII)
+	}
 }
 
 func TestUsageOptInFlowAndStrictNoNetwork(t *testing.T) {
@@ -89,13 +104,22 @@ func TestUsageOptInFlowAndStrictNoNetwork(t *testing.T) {
 	})
 	env, _ := setupCLIEnv(t, forbidNet)
 
-	// Default status: all off
+	// Default status: all on
 	rc, out, _ := runCmd(env, "", false, "usage")
-	if rc != 0 || !strings.Contains(out, "Claude Code  usage off") {
+	if rc != 0 || !strings.Contains(out, "Claude Code  usage on") {
 		t.Fatalf("unexpected usage status: rc=%d out=%q", rc, out)
 	}
 
-	// Non-TTY without --yes fails cleanly
+	// Turn off all
+	rc, out, _ = runCmd(env, "", false, "usage", "off", "all")
+	if rc != 0 || !strings.Contains(out, "Usage meters off") {
+		t.Fatalf("unexpected usage off output: rc=%d out=%q", rc, out)
+	}
+	if config.UsageEnabled(env.Root, "claude") {
+		t.Fatal("expected claude usage off")
+	}
+
+	// Non-TTY without --yes fails cleanly when turning back on
 	rc, _, errOut := runCmd(env, "", false, "usage", "on", "c")
 	if rc != 1 || !strings.Contains(errOut, "--yes") {
 		t.Fatalf("expected confirmation failure without --yes: rc=%d err=%q", rc, errOut)
@@ -122,7 +146,7 @@ func TestUsageOptInFlowAndStrictNoNetwork(t *testing.T) {
 		t.Fatal("expected claude usage on")
 	}
 
-	// Turn off
+	// Turn off again
 	rc, out, _ = runCmd(env, "", false, "usage", "off", "all")
 	if rc != 0 || !strings.Contains(out, "Usage meters off") {
 		t.Fatalf("unexpected usage off output: rc=%d out=%q", rc, out)
@@ -184,6 +208,9 @@ func TestFullCLICRUDAndJSONAndEmptyLast(t *testing.T) {
 	if rc, out, _ := runCmd(env, "", false, "x", "switch", "primary"); rc != 0 || !strings.Contains(out, "Switched to slot 1") {
 		t.Fatalf("switch by alias failed: rc=%d out=%q", rc, out)
 	}
+
+	// Turn usage off to verify zero network when off.
+	_ = config.SetUsage(env.Root, config.ToolKeys, false)
 
 	// `tori list` should show Codex FIRST, and Claude Code / Antigravity LAST!
 	rc, listOut, _ := runCmd(env, "", false, "list")

@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/tori.svg" alt="Tori" width="150"></p>
 
-Tori is a fast terminal account switcher for **Claude Code**, **Codex** and **Antigravity**, with optional usage meters for every saved account (off by default, see [Usage meters](#usage-meters)).
+Tori is a fast terminal account switcher for **Claude Code**, **Codex** and **Antigravity**, with built-in quota meters for every saved account (on by default, see [Usage meters](#usage-meters)).
 
 ![Tori interactive picker](docs/screenshot.png)
 
@@ -53,39 +53,41 @@ tori g add primary      # while signed in to Antigravity (in T3 Code)
 tori g add backup       # after signing in with the next account
 ```
 
-The alias is optional; the Google email is read the first time usage loads (with meters on). Restart any running Antigravity session after switching.
+The alias is optional; the Google email is read the first time usage loads. Restart any running Antigravity session after switching.
 
 ## Picker keys & mouse
 
-Run `tori` with no arguments to open the interactive Bubble Tea picker (supports keyboard and mouse).
+Run `tori` with no arguments to open the interactive Bubble Tea picker (supports keyboard and mouse). Use `tori --ascii`, `TORI_ASCII=1` (auto-enabled on `TERM=linux`) for pure ASCII glyphs, `NO_COLOR=1` for monochrome output, and `TORI_NO_ANIM=1` for a static loading indicator.
 
 | Key / Mouse | Action |
 |---|---|
 | `↑` `↓` / `j` `k` / scroll wheel | Move selection |
-| Hover / Click / Double-click | Hover rows, footer pills, and modal buttons; click buttons or footer shortcuts; double-click row to switch |
+| Hover / Click / Double-click | Hover rows, click to select, double-click to switch, click footer shortcuts or dialog choices |
 | `Enter` | Switch to the selected account (or add on an empty tool) |
-| `Tab` | Jump to the next tool |
-| `a` | Guided add for all 3 tools (saves a new signed-in account right away, or guides you to log out & sign in to the next account and re-check) |
+| `Tab` | Jump to the first account of the next tool |
+| `a` | Guided add account flow (pick tool, sign in & re-check, update existing slot, or save with optional alias) |
+| `d` / `Delete` | Guided remove (safe default: never removes on a single keypress; offers switch-and-remove or clear login when active) |
+| `u` | Turn meters on or off for the selected tool |
 | `b` | Rotate every tool with 2 or more saved accounts |
-| `d` / `Delete` | Guided remove (for active slots, offers one-key switch-and-remove or clear local login; renumbers remaining slots) |
-| `u` | Turn usage meters on or off for the selected tool (shows a disclaimer modal before turning on) |
-| `r` | Force-refresh usage (tools with meters on) |
-| `q` / `Esc` / `Ctrl+C` | Quit (or close active modal first on `Esc`) |
+| `r` | Refresh usage now |
+| `?` | Show full key list and bar legend |
+| `Esc` | Close active dialog |
+| `q` / `Ctrl+C` | Quit (`Ctrl+C` always works) |
 
 ## Usage meters
 
-Meters are optional and **off by default**. While a tool's meters are off, Tori makes zero network requests for it. Turn them on per tool with `u` in the picker or `tori usage on c` (also `x`, `g`, `all`); both show a disclaimer first, and the choice is saved in `~/.tori/config.json`. Switching, adding and removing accounts never need the network.
+Meters are **on by default** and can be turned off per tool any time with `u` in the picker or `tori usage off c` (also `x`, `g`, `all`). Choices are saved in `~/.tori/config.json`. While a tool's meters are off, Tori makes zero network requests for it. Switching, adding and removing accounts never need the network.
 
-Meters are green below 60%, yellow from 60%, red from 85%, with a reset countdown when known. Readings are cached locally (180s TTL), manual refreshes enforce a 30s minimum cooldown with in-flight request deduplication, and HTTP 429 / transient errors trigger persisted exponential backoff (honoring `Retry-After`) while keeping last-known cached bars.
+In the picker, each account fits on one line on wide terminals (100+ columns) with both quota windows side by side, and collapses to the lowest remaining window on narrow terminals (42–99 columns) while expanding the selected account. Bars show percent **left** in neutral gray-blue, turning amber at 20% left (`!`) and red at 0% (`✕`). The white `│` pace line marks the share of the window still ahead until reset — fill past it means quota to spare, fill short of it means you are burning faster than time passes. `tori list` shows the percentage used. Readings are cached locally (180s TTL), manual refreshes enforce a 30s minimum cooldown with in-flight request deduplication, and HTTP 429 / transient errors trigger persisted exponential backoff (honoring `Retry-After`) while keeping last-known readings.
 
 ## CLI reference
 
 ```bash
-tori                   # interactive picker
+tori [--ascii]         # interactive picker
 tori list              # all accounts; meters if on (--no-usage hides, --refresh re-reads, --json)
-tori usage             # show meters on/off per tool
-tori usage on c        # c|x|g|all; shows the disclaimer, asks y/N (--yes skips)
-tori usage off all
+tori usage             # show meters on/off per tool (on by default)
+tori usage off all     # turn meters off (c|x|g|all)
+tori usage on c        # turn meters back on; shows disclaimer, asks y/N (--yes skips)
 tori status            # current account per tool
 tori switch            # rotate every tool to its next account
 tori --version         # print version
@@ -108,14 +110,14 @@ Tori sits beside Claude Code, Codex and Antigravity, not between them and the pr
 
 ## Terms of use
 
-Usage meters are off by default. When on, Tori reads quota directly from each provider using your saved logins (and may refresh expired tokens). Nothing is sent anywhere else, and you can turn meters off any time.
+When usage meters are on (the default), Tori reads quota directly from each provider using your saved logins (and may refresh expired tokens). Nothing is sent anywhere else, and you can turn meters off per tool any time (`u` in the picker or `tori usage off <c|x|g|all>`).
 
-- **Antigravity**: Google's terms prohibit third-party tools using Antigravity sign-in and may lead to account suspension. Turn Antigravity meters on only if you accept that risk.
+- **Antigravity**: Google's terms prohibit third-party tools using Antigravity sign-in and may lead to account suspension. Turn Antigravity meters off with `tori usage off g` if you prefer not to read Antigravity quotas.
 
 ## Privacy
 
 - Saved logins live only on your machine, under `~/.tori/` (`claude`, `codex`, `antigravity`), written atomically with `0600` permissions. Never share that folder.
-- With meters off (the default) Tori makes no network calls. With them on, the only calls go to each provider's own usage and token endpoints (Anthropic, OpenAI, Google), to read quotas and to refresh an inactive account's expired token.
+- With meters on, the only network calls go to each provider's own usage and token endpoints (Anthropic, OpenAI, Google), to read quotas and refresh an inactive account's expired token. With meters off (`tori usage off all` or `--no-usage`), Tori makes no network calls.
 - Accounts saved by earlier versions (`~/.claudeswap`, `~/.codexswap`, `~/.aswap`) are moved into `~/.tori/` automatically on first run.
 - Claude Code on macOS stores its login in the Keychain, which is currently unsupported.
 
