@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/Anurag-Raut/tori/internal/store"
@@ -48,8 +49,19 @@ type Config struct {
 	Usage map[string]bool `json:"usage"`
 }
 
-// HomeDir resolves the user's home directory, respecting $HOME.
+// HomeDir resolves the user's home directory.
+// On Windows, os.UserHomeDir() (USERPROFILE) takes precedence over HOME so
+// Git Bash/MSYS2/Cygwin shells still resolve the same directory as Codex and Claude Code.
 func HomeDir() string {
+	if runtime.GOOS == "windows" {
+		if h, err := os.UserHomeDir(); err == nil && h != "" {
+			return h
+		}
+		if h := os.Getenv("HOME"); h != "" {
+			return h
+		}
+		return ""
+	}
 	if h := os.Getenv("HOME"); h != "" {
 		return h
 	}

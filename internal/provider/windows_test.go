@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Anurag-Raut/tori/internal/store"
+	"github.com/zalando/go-keyring"
 )
 
 func TestWindowsKeyringHelpersAndTargets(t *testing.T) {
@@ -28,14 +29,30 @@ func TestWindowsKeyringHelpersAndTargets(t *testing.T) {
 		t.Fatalf("UTF-8 decode mismatch: got %q", got)
 	}
 
-	// UTF-16LE encoded JSON blob (with trailing NUL).
-	var utf16le []byte
-	for _, r := range plain {
-		utf16le = append(utf16le, byte(r), 0)
+	// Rust-style target must encode as UTF-16LE (including non-BMP surrogate pairs).
+	withEmoji := `{"token":{"label":"work 🚀","refresh_token":"1//0rt-win"}}`
+	rustBlob := encodeWindowsCredBlob(codexTargets[0], codexKeyringService, "cli|0123456789abcdef", withEmoji, nil)
+	if !isWindowsUTF16LEBlob(rustBlob) {
+		t.Fatalf("expected UTF-16LE encoding for Rust-style target, got %x", rustBlob)
 	}
-	utf16le = append(utf16le, 0, 0)
-	if got := decodeWindowsCredBlob(utf16le); got != plain {
-		t.Fatalf("UTF-16LE decode mismatch: got %q", got)
+	if got := decodeWindowsCredBlob(rustBlob); got != withEmoji {
+		t.Fatalf("UTF-16LE round-trip mismatch: got %q, want %q", got, withEmoji)
+	}
+
+	// Go-style target encodes as UTF-8 by default, and preserves UTF-16LE if existing entry was UTF-16LE.
+	goUTF8 := encodeWindowsCredBlob(agyTargets[0], agyKeyringService, agyKeyringUser, plain, nil)
+	if string(goUTF8) != plain {
+		t.Fatalf("expected UTF-8 encoding for Go-style target, got %q", string(goUTF8))
+	}
+	goMirrored := encodeWindowsCredBlob(agyTargets[0], agyKeyringService, agyKeyringUser, plain, rustBlob)
+	if !isWindowsUTF16LEBlob(goMirrored) || decodeWindowsCredBlob(goMirrored) != plain {
+		t.Fatalf("expected mirrored UTF-16LE encoding when existing blob is UTF-16LE")
+	}
+
+	// UTF-16LE with trailing NUL still decodes cleanly.
+	withNul := append(encodeWindowsUTF16LE(plain), 0, 0)
+	if got := decodeWindowsCredBlob(withNul); got != plain {
+		t.Fatalf("UTF-16LE with NUL decode mismatch: got %q", got)
 	}
 }
 
@@ -180,3 +197,80 @@ func TestWindowsCodexVerbatimKeyringHash(t *testing.T) {
 		t.Fatalf("expected Windows Claude login, got %+v err=%v", st, err)
 	}
 }
+
+type sizeLimitedKeyring struct {
+	*memKeyring
+	maxBytes int
+}
+
+func (s *sizeLimitedKeyring) Set(service, user, secret string) error {
+	if len(secret) > s.maxBytes {
+		return keyring.ErrSetDataTooBig
+	}
+	return s.memKeyring.Set(service, user, secret)
+}
+
+func TestCodexAutoModeClearsStaleKeyringAndClearLiveFallbackHash(t *testing.T) {
+	env, _ := newTestEnv(t, nil)
+	env.GOOS = "windows"
+	mem := newMemKeyring()
+	env.Keyring = &sizeLimitedKeyring{memKeyring: mem, maxBytes: 200}
+	x := &Codex{}
+
+	codexDir := filepath.Join(env.Home, ".codex")
+	_ = os.MkdirAll(codexDir, 0o700)
+	_ = os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte("cli_auth_credentials_store = \"auto\"\n"), 0o600)
+
+	// 1. Seed a small API-key login under the non-verbatim fallback hash (candidates[1]).
+	candidates := x.keyringAccounts(env)
+	if len(candidates) < 2 {
+		t.Fatalf("expected verbatim + plain candidates on windows, got %v", candidates)
+	}
+	apiKeyJSON := `{"auth_mode":"apikey","OPENAI_API_KEY":"sk-old-api-key"}`
+	if err := mem.Set(codexKeyringService, candidates[1], apiKeyJSON); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify ClearLive removes the non-verbatim fallback hash entry and restore brings it back.
+	restore, err := x.ClearLive(env)
+	if err != nil {
+		t.Fatalf("ClearLive failed: %v", err)
+	}
+	if _, err := mem.Get(codexKeyringService, candidates[1]); err == nil {
+		t.Fatalf("expected ClearLive to remove fallback keyring account %q", candidates[1])
+	}
+	if err := restore(); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	if got, err := mem.Get(codexKeyringService, candidates[1]); err != nil || got != apiKeyJSON {
+		t.Fatalf("expected restore to restore fallback keyring account, got (%q, %v)", got, err)
+	}
+
+	// 2. Now switch in `auto` mode to a large OAuth login that exceeds the keyring size limit.
+	//    Tori must write auth.json AND delete the stale API-key keyring entry so it won't shadow auth.json.
+	largeOAuth := map[string]any{
+		"auth_mode": "chatgpt",
+		"tokens": map[string]any{
+			"access_token":  makeJWT(map[string]any{"exp": env.now().Unix() + 3600, "pad": strings.Repeat("a", 300)}),
+			"refresh_token": "rt-large-oauth",
+			"account_id":    "acct-oauth-1",
+			"id_token": makeJWT(map[string]any{
+				"email":                       "oauth@example.com",
+				"https://api.openai.com/auth": map[string]any{"chatgpt_plan_type": "pro"},
+			}),
+		},
+	}
+	if err := x.applyLive(env, largeOAuth); err != nil {
+		t.Fatalf("applyLive(auto) failed: %v", err)
+	}
+	for _, acct := range candidates {
+		if got, err := mem.Get(codexKeyringService, acct); err == nil {
+			t.Fatalf("expected stale keyring entry %q to be deleted on auto fallback, still found %q", acct, got)
+		}
+	}
+	st, err := x.Status(env)
+	if err != nil || !st.LoggedIn || st.DisplayName != "oauth@example.com" {
+		t.Fatalf("expected OAuth login via auth.json after auto fallback, got %+v err=%v", st, err)
+	}
+}
+

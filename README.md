@@ -48,9 +48,9 @@ Installs `tori` to `~/.local/bin` (override with `PREFIX=/usr/local/bin` or pin 
 go install github.com/Anurag-Raut/tori@latest
 ```
 
-### Prebuilt binaries & source
+### Prebuilt binaries & source (including Windows)
 
-Grab a release archive from [GitHub Releases](https://github.com/Anurag-Raut/tori/releases), or build from source (Go 1.24+):
+On Windows, install via `npm install -g tori-switch`, `go install`, or grab the `.zip` archive from [GitHub Releases](https://github.com/Anurag-Raut/tori/releases). You can also build from source on any OS (Go 1.24+):
 
 ```bash
 git clone https://github.com/Anurag-Raut/tori.git
@@ -98,8 +98,10 @@ The alias is optional — Tori reads the email directly from native logins (and 
 | Tool | Linux | macOS | Windows | Notes |
 |---|---|---|---|---|
 | **Claude Code** | Supported | Supported | Supported | `.credentials.json` (Linux/Windows), macOS Keychain (`Claude Code-credentials`), `CLAUDE_CONFIG_DIR`, and `CLAUDE_SECURESTORAGE_CONFIG_DIR` |
-| **Codex CLI** | Supported | Supported | Supported | ChatGPT OAuth & API keys, `auth.json`, and OS keyring (`Codex Auth` via `cli_auth_credentials_store`) |
+| **Codex CLI** | Supported | Supported | Supported | ChatGPT OAuth & API keys via `auth.json` and OS keyring (`Codex Auth`). On Windows, Credential Manager's 2,560-byte limit fits API keys only; OAuth logins use `file` (default) or `auto` |
 | **Antigravity** | Supported | Supported | Supported | Desktop/Classic & IDE (`state.vscdb`), CLI `agy` & Desktop 2.x (OS keyring + token files), and T3 Code (`acp_token.json` / `antigravity-oauth-token`) |
+
+> **macOS Keychain note:** On macOS, the first time `claude`, `codex`, or `agy` reads a Keychain item written by Tori, macOS may show a one-time "Allow access" prompt.
 
 ## Reading the quota bars
 

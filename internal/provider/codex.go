@@ -133,7 +133,13 @@ func (x *Codex) keyringAccounts(env *Env) []string {
 	if env.GOOS == "windows" {
 		winHome := strings.ReplaceAll(home, "/", `\`)
 		if !strings.HasPrefix(winHome, `\\?\`) {
-			verb := hashKey(`\\?\` + winHome)
+			var verbatim string
+			if strings.HasPrefix(winHome, `\\`) {
+				verbatim = `\\?\UNC\` + strings.TrimPrefix(winHome, `\\`)
+			} else {
+				verbatim = `\\?\` + winHome
+			}
+			verb := hashKey(verbatim)
 			if verb != primary {
 				return []string{verb, primary}
 			}
@@ -142,9 +148,9 @@ func (x *Codex) keyringAccounts(env *Env) []string {
 	return []string{primary}
 }
 
-func (x *Codex) readKeyring(env *Env) (map[string]any, string, error) {
+func (x *Codex) readKeyringWithAccount(env *Env) (map[string]any, string, string, error) {
 	if env.getenv("TORI_CODEX_AUTH") != "" || env.Keyring == nil {
-		return nil, "", nil
+		return nil, "", "", nil
 	}
 	var lastErr error
 	for _, acct := range x.keyringAccounts(env) {
@@ -157,10 +163,15 @@ func (x *Codex) readKeyring(env *Env) (map[string]any, string, error) {
 		}
 		var m map[string]any
 		if err := json.Unmarshal([]byte(raw), &m); err == nil && len(m) > 0 {
-			return m, raw, nil
+			return m, raw, acct, nil
 		}
 	}
-	return nil, "", lastErr
+	return nil, "", "", lastErr
+}
+
+func (x *Codex) readKeyring(env *Env) (map[string]any, string, error) {
+	m, raw, _, err := x.readKeyringWithAccount(env)
+	return m, raw, err
 }
 
 func (x *Codex) jwtPayload(token string) map[string]any {
@@ -238,6 +249,18 @@ func (x *Codex) readLive(env *Env) map[string]any {
 	return nil
 }
 
+func (x *Codex) deleteKeyringAccounts(env *Env, skip string) {
+	if env.Keyring == nil {
+		return
+	}
+	for _, a := range x.keyringAccounts(env) {
+		if a == skip {
+			continue
+		}
+		_ = env.Keyring.Delete(codexKeyringService, a)
+	}
+}
+
 func (x *Codex) applyLive(env *Env, auth map[string]any) error {
 	if env.getenv("TORI_CODEX_AUTH") != "" {
 		return store.WriteJSONAtomic(x.livePath(env), auth, 0o600, false)
@@ -256,27 +279,36 @@ func (x *Codex) applyLive(env *Env, auth map[string]any) error {
 		if err := env.Keyring.Set(codexKeyringService, acct, string(raw)); err != nil {
 			return Failf("could not write Codex login to OS keyring: %v", err)
 		}
+		x.deleteKeyringAccounts(env, acct)
 		_ = os.Remove(x.livePath(env))
 		return nil
 	case "auto":
 		if env.Keyring != nil {
 			if raw, err := json.Marshal(auth); err == nil {
 				if err := env.Keyring.Set(codexKeyringService, acct, string(raw)); err == nil {
+					x.deleteKeyringAccounts(env, acct)
 					_ = os.Remove(x.livePath(env))
 					return nil
 				}
 			}
+			// Remove any stale keyring entry so it cannot shadow auth.json in Codex auto mode.
+			x.deleteKeyringAccounts(env, "")
 		}
 		return store.WriteJSONAtomic(x.livePath(env), auth, 0o600, false)
 	default:
 		if err := store.WriteJSONAtomic(x.livePath(env), auth, 0o600, false); err != nil {
 			return err
 		}
-		// Keep any existing keyring entry in sync so switching doesn't leave stale credentials.
+		// Keep any existing keyring entry in sync (or clear it if the new payload doesn't fit)
+		// so switching doesn't leave stale credentials behind.
 		if env.Keyring != nil {
-			if existing, _, _ := x.readKeyring(env); len(existing) > 0 {
+			if existing, _, matchedAcct, _ := x.readKeyringWithAccount(env); len(existing) > 0 {
 				if raw, err := json.Marshal(auth); err == nil {
-					_ = env.Keyring.Set(codexKeyringService, acct, string(raw))
+					if err := env.Keyring.Set(codexKeyringService, matchedAcct, string(raw)); err != nil {
+						x.deleteKeyringAccounts(env, "")
+					} else {
+						x.deleteKeyringAccounts(env, matchedAcct)
+					}
 				}
 			}
 		}
@@ -407,8 +439,8 @@ func (x *Codex) ClearLive(env *Env) (func() error, error) {
 
 	var krAcct, krRaw string
 	if env.getenv("TORI_CODEX_AUTH") == "" && env.Keyring != nil {
-		if _, raw, _ := x.readKeyring(env); raw != "" {
-			krAcct = x.keyringAccount(env)
+		if _, raw, acct, _ := x.readKeyringWithAccount(env); raw != "" {
+			krAcct = acct
 			krRaw = raw
 		}
 	}
@@ -425,6 +457,7 @@ func (x *Codex) ClearLive(env *Env) (func() error, error) {
 		if err := env.Keyring.Delete(codexKeyringService, krAcct); err != nil {
 			return nil, err
 		}
+		x.deleteKeyringAccounts(env, krAcct)
 	}
 
 	restore := func() error {

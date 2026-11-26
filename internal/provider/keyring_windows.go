@@ -10,8 +10,6 @@ import (
 	"github.com/zalando/go-keyring"
 )
 
-const windowsCredMaxBlobBytes = 2560
-
 // osKeyring uses Windows Credential Manager directly so Tori reads and writes both
 // Go go-keyring ("<service>:<user>") and Rust keyring ("<user>.<service>") entries.
 type osKeyring struct{}
@@ -35,20 +33,30 @@ func (osKeyring) Get(service, user string) (string, error) {
 }
 
 func (osKeyring) Set(service, user, secret string) error {
-	if len(secret) > windowsCredMaxBlobBytes {
-		return fmt.Errorf("credential exceeds Windows Credential Manager %d-byte limit: %w", windowsCredMaxBlobBytes, keyring.ErrSetDataTooBig)
-	}
 	targets := windowsCredTargetNames(service, user)
 	chosen := targets[0]
+	var existing *wincred.GenericCredential
 	for _, target := range targets {
-		if _, err := wincred.GetGenericCredential(target); err == nil {
+		if cred, err := wincred.GetGenericCredential(target); err == nil {
 			chosen = target
+			existing = cred
 			break
 		}
 	}
+	var existingBlob []byte
+	if existing != nil {
+		existingBlob = existing.CredentialBlob
+	}
+	blob := encodeWindowsCredBlob(chosen, service, user, secret, existingBlob)
+	if len(blob) > windowsCredMaxBlobBytes {
+		return fmt.Errorf("encoded credential (%d bytes) exceeds Windows Credential Manager %d-byte limit: %w", len(blob), windowsCredMaxBlobBytes, keyring.ErrSetDataTooBig)
+	}
 	cred := wincred.NewGenericCredential(chosen)
 	cred.UserName = user
-	cred.CredentialBlob = []byte(secret)
+	cred.CredentialBlob = blob
+	if existing != nil && existing.Persist != 0 {
+		cred.Persist = existing.Persist
+	}
 	return cred.Write()
 }
 

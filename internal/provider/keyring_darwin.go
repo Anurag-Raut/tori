@@ -37,7 +37,7 @@ func (osKeyring) Get(service, user string) (string, error) {
 
 func (osKeyring) Set(service, user, secret string) error {
 	cmdLine := buildSecurityAddCommand(service, user, secret)
-	if len(cmdLine) <= darwinSecurityInteractiveMaxLen {
+	if !strings.ContainsAny(service+user, "\r\n") && len(cmdLine) <= darwinSecurityInteractiveMaxLen {
 		cmd := exec.Command(darwinSecurityBin, "-i")
 		cmd.Stdin = strings.NewReader(cmdLine)
 		out, err := cmd.CombinedOutput()
