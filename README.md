@@ -1,6 +1,7 @@
 <div align="center">
   <img src="docs/tori.svg" alt="Tori" width="150">
   <p><strong>Switch between Claude Code, Codex, and Antigravity accounts from your terminal — with live quota bars for every account.</strong></p>
+  <p>Linux · macOS · Windows</p>
 
   <p>
     <a href="https://github.com/Anurag-Raut/tori/releases"><img src="https://img.shields.io/github/v/release/Anurag-Raut/tori?style=flat-square" alt="Release"></a>
@@ -16,13 +17,13 @@
 
 - **Three tools, one picker** — manage multiple **Claude Code**, **Codex CLI**, and **Antigravity** (Desktop, IDE, CLI `agy`, and T3 Code) logins side by side.
 - **Live quota and pace bars** — see remaining 5-hour and 7-day quota, reset timers, and whether you're ahead or behind pace across every saved account.
-- **No proxy, no daemon** — Tori swaps your own local login files atomically (`0600`) when you ask it to. Your tools keep talking directly to their providers.
+- **No proxy, no daemon** — Tori swaps your own local logins (files and OS keyring entries) only when you ask it to. Your tools keep talking directly to their providers.
 - **Interactive TUI + scriptable CLI** — navigate with keyboard or mouse in the Bubble Tea picker, or automate workflows with subcommands and `--json`.
-- **Single static binary** — built in Go with zero runtime dependencies.
+- **Linux, macOS, and Windows** — a single static Go binary for x64 and arm64, with zero runtime dependencies.
 
 ## Install
 
-### npm
+### npm (Linux, macOS & Windows)
 
 ```bash
 npm install -g tori-switch
@@ -40,17 +41,21 @@ npx tori-switch
 curl -fsSL https://raw.githubusercontent.com/Anurag-Raut/tori/main/install.sh | sh
 ```
 
-Installs `tori` to `~/.local/bin` (override with `PREFIX=/usr/local/bin` or pin a version with `VERSION=v0.2.0`). Make sure `~/.local/bin` is on your `PATH`.
+Installs `tori` to `~/.local/bin` (override with `PREFIX=/usr/local/bin` or pin a version with `VERSION=v0.3.0`). Make sure `~/.local/bin` is on your `PATH`.
 
-### Go
+### Windows binary
+
+Download the `.zip` for your architecture (`windows_amd64` or `windows_arm64`) from [GitHub Releases](https://github.com/Anurag-Raut/tori/releases), extract `tori.exe`, and put it in a folder on your `PATH`.
+
+### Go (any OS)
 
 ```bash
 go install github.com/Anurag-Raut/tori@latest
 ```
 
-### Prebuilt binaries & source (including Windows)
+### Prebuilt binaries & source
 
-On Windows, install via `npm install -g tori-switch`, `go install`, or grab the `.zip` archive from [GitHub Releases](https://github.com/Anurag-Raut/tori/releases). You can also build from source on any OS (Go 1.24+):
+Archives for every platform are on [GitHub Releases](https://github.com/Anurag-Raut/tori/releases). To build from source (Go 1.24+):
 
 ```bash
 git clone https://github.com/Anurag-Raut/tori.git
@@ -155,7 +160,7 @@ Every tool supports `list` (`ls`), `status`, `add [alias]`, `switch` (`sw`), `re
 
 ## Configuration & environment
 
-Preferences live in `~/.tori/config.json` and saved credentials under `~/.tori/{claude,codex,antigravity}`.
+Preferences live in `~/.tori/config.json` and saved credentials under `~/.tori/{claude,codex,antigravity}`. On Windows, `~` is your user profile (`%USERPROFILE%`).
 
 | Variable | Description |
 |---|---|
@@ -169,7 +174,7 @@ Preferences live in `~/.tori/config.json` and saved credentials under `~/.tori/{
 
 ## Privacy & terms
 
-- **Local only** — saved logins stay on your machine under `~/.tori/`, written atomically with `0600` permissions. Never share that folder.
+- **Local only** — saved logins stay on your machine under `~/.tori/`, written atomically. Files are created with `0600` permissions on Linux and macOS; on Windows they inherit your folder's permissions. Never share that folder.
 - **Direct connections** — Tori is not a proxy and runs no background service. When quota meters are enabled, requests go directly to Anthropic, OpenAI, and Google to read usage (and refresh expired tokens when needed). Turning meters off (`tori usage off all` or `--no-usage`) stops all network traffic; switching, adding, and removing accounts work offline.
 - **Antigravity note** — Google's terms prohibit third-party tools using Antigravity sign-in and may risk account suspension. Turn Antigravity meters off with `tori usage off g` if you prefer not to query Antigravity quotas.
 
