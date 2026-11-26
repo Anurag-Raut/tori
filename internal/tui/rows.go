@@ -190,10 +190,10 @@ func renderWideWindowCells(views []windowView, cols wideColumns, rs rowStyles, g
 	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
 }
 
-// renderSingleWideWindow renders a 16+barW cell window (26 cells when barW=10):
-// label(3) + bar(barW) + gap(1) + pct(4) + flag(2) + reset(6).
+// renderSingleWideWindow renders a 17+barW cell window (27 cells when barW=10):
+// label(4) + bar(barW) + gap(1) + pct(4) + flag(2) + reset(6).
 func renderSingleWideWindow(v windowView, barW int, rs rowStyles, g glyphs, noColor bool) string {
-	label := rs.dim.Render(fitCell(v.label, 3, false))
+	label := rs.dim.Render(fitCell(v.label, 3, false) + " ")
 
 	if v.noReading {
 		cells := barCells(0, -1, barW)
@@ -540,12 +540,13 @@ func renderNarrowExpanded(
 
 func renderNarrowWindowLine(v windowView, innerW int, indent, rPad string, rs rowStyles, g glyphs, noColor bool) string {
 	const barW = 10
-	label := rs.dim.Render(fitCell(v.label, 3, false))
+	const labelW = 4
+	label := rs.dim.Render(fitCell(v.label, 3, false) + " ")
 
 	if v.noReading {
 		bar := renderBar(barCells(0, -1, barW), barOK, rs, g, noColor)
 		pct := rs.dim.Render(fitCell(g.dash, 4, true))
-		used := 3 + barW + 1 + 4
+		used := labelW + barW + 1 + 4
 		tail := ""
 		if rem := innerW - used; rem > 0 {
 			tail = rs.space.Render(strings.Repeat(" ", rem))
@@ -570,7 +571,7 @@ func renderNarrowWindowLine(v windowView, innerW int, indent, rPad string, rs ro
 	}
 	pct := pctStyle.Render(fitCell(pctStr, 4, true))
 
-	used := 3 + barW + 1 + 4 + lipgloss.Width(flagStr)
+	used := labelW + barW + 1 + 4 + lipgloss.Width(flagStr)
 	resetPart := ""
 	if v.hasReset {
 		resetText := " " + g.reset + formatReset(v.resetDur)

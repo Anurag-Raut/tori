@@ -352,7 +352,7 @@ func TestBarCellsTable(t *testing.T) {
 		}
 	}
 
-	// Window-not-started case (100% left, no resetsAt -> pace line at last cell, blank reset).
+	// Window-not-started case (100% left, no resetsAt -> full bar, no pace line, blank reset).
 	now := fixedNow()
 	views := buildWindowViews(&provider.UsageInfo{
 		Windows: []provider.Window{{Label: "5h", Pct: 0, ResetsAt: nil}},
@@ -364,16 +364,50 @@ func TestBarCellsTable(t *testing.T) {
 	if v.hasReset {
 		t.Fatal("expected blank reset on window not started")
 	}
-	if v.timeLeft != 1.0 {
-		t.Fatalf("expected timeLeft=1.0 for window not started, got %v", v.timeLeft)
+	if v.timeLeft >= 0 {
+		t.Fatalf("expected negative timeLeft for window not started, got %v", v.timeLeft)
 	}
 	cells := barCells(v.leftPct, v.timeLeft, width)
-	if cells[width-1] != cellPace {
-		t.Fatalf("expected pace line in last cell, got %v", cells)
-	}
-	for i := 0; i < width-1; i++ {
+	for i := 0; i < width; i++ {
 		if cells[i] != cellFill {
-			t.Fatalf("expected cell[%d]=cellFill, got %v", i, cells[i])
+			t.Fatalf("expected cell[%d]=cellFill, got %v", i, cells)
+		}
+	}
+
+	// Ahead/behind pace separation: when quota left and time left diverge by >= 4%,
+	// surplus fill past the pace line or a track gap before it must remain visible.
+	for _, bw := range []int{10, 14} {
+		ahead := barCells(31, 64.0/300.0, bw)
+		paceIdx := -1
+		for i, c := range ahead {
+			if c == cellPace {
+				paceIdx = i
+			}
+		}
+		if paceIdx < 0 || paceIdx+1 >= bw || ahead[paceIdx+1] != cellFill {
+			t.Fatalf("width=%d ahead (31%% vs 21.3%%): expected fill past pace, got %v", bw, ahead)
+		}
+
+		behind7d := barCells(69, 129.0/168.0, bw)
+		paceIdx = -1
+		for i, c := range behind7d {
+			if c == cellPace {
+				paceIdx = i
+			}
+		}
+		if paceIdx <= 0 || behind7d[paceIdx-1] != cellTrack {
+			t.Fatalf("width=%d behind (69%% vs 76.8%%): expected track gap before pace, got %v", bw, behind7d)
+		}
+
+		behind5h := barCells(16, 76.0/300.0, bw)
+		paceIdx = -1
+		for i, c := range behind5h {
+			if c == cellPace {
+				paceIdx = i
+			}
+		}
+		if paceIdx <= 0 || behind5h[paceIdx-1] != cellTrack {
+			t.Fatalf("width=%d behind (16%% vs 25.3%%): expected track gap before pace, got %v", bw, behind5h)
 		}
 	}
 
@@ -403,6 +437,28 @@ func TestBarStateThresholds(t *testing.T) {
 		if got := barState(tc.left); got != tc.want {
 			t.Errorf("barState(%.0f) = %v, want %v", tc.left, got, tc.want)
 		}
+	}
+}
+
+func TestWindowLabelSpacing(t *testing.T) {
+	setupTestEnv(t, nil)
+	th := newTheme(true)
+	g := newGlyphs(true, true)
+	v := windowView{
+		label:    "30d",
+		leftPct:  42,
+		timeLeft: 17.0 / 30.0,
+		hasReset: true,
+		resetDur: 17 * 24 * time.Hour,
+		level:    barOK,
+	}
+	wide := renderSingleWideWindow(v, 10, th.rowNormal, g, true)
+	if !strings.HasPrefix(wide, "30d =") {
+		t.Fatalf("expected space between 30d label and bar in wide mode, got %q", wide)
+	}
+	narrow := renderNarrowWindowLine(v, 36, "    ", " ", th.rowNormal, g, true)
+	if !strings.Contains(narrow, "30d =") {
+		t.Fatalf("expected space between 30d label and bar in narrow mode, got %q", narrow)
 	}
 }
 
