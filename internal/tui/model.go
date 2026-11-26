@@ -2,50 +2,77 @@ package tui
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
 
 	"github.com/Anurag-Raut/tori/internal/config"
 	"github.com/Anurag-Raut/tori/internal/provider"
 )
 
-type modalKind int
-
-const (
-	modalNone modalKind = iota
-	modalAdd
-	modalDelete
-	modalDisclaimer
+var (
+	clockTickInterval = 30 * time.Second
+	usageTickInterval = 60 * time.Second
+	successMsgTTL     = 3 * time.Second
+	errorMsgTTL       = 5 * time.Second
 )
 
-type addStep int
+type rowID struct {
+	providerKey string
+	slotNum     int
+	email       string
+	placeholder bool
+}
 
-const (
-	addStepGuide addStep = iota
-	addStepSave
-)
-
-type msgTone int
-
-const (
-	toneNormal msgTone = iota
-	toneGreen
-	toneYellow
-	toneRed
-)
+func idForRow(r flatRow) rowID {
+	if r.account == nil {
+		return rowID{providerKey: r.provider.Key(), placeholder: true}
+	}
+	return rowID{
+		providerKey: r.provider.Key(),
+		slotNum:     r.account.Number,
+		email:       r.account.Email,
+	}
+}
 
 type flatRow struct {
 	provider provider.Provider
-	account  *provider.AccountEntry // nil for an empty or errored provider placeholder
+	account  *provider.AccountEntry // nil for empty or errored tool placeholder
+	loadErr  bool
+}
+
+type lineRange struct {
+	start int
+	end   int // inclusive
+}
+
+type footerHit struct {
+	action string
+	x0, x1 int
+}
+
+type headerMsgKind int
+
+const (
+	msgNone headerMsgKind = iota
+	msgSuccess
+	msgInfo
+	msgWarning
+	msgError
+)
+
+type headerMsg struct {
+	kind headerMsgKind
+	text string
+	seq  int
 }
 
 type usageResult struct {
@@ -56,8 +83,16 @@ type usageResult struct {
 
 type usageLoadedMsg struct {
 	results []usageResult
-	note    string
 	forced  bool
+	now     time.Time
+}
+
+type switchDoneMsg struct {
+	ok          bool
+	providerKey string
+	email       string
+	errText     string
+	now         time.Time
 }
 
 type actionDoneMsg struct {
@@ -65,40 +100,21 @@ type actionDoneMsg struct {
 	text      string
 	refresh   bool
 	selectKey string
-	selectNum int
+	now       time.Time
 }
 
-type keyItem struct {
-	key       string
-	label     string
-	actionKey string
+type addStatusMsg struct {
+	provider provider.Provider
+	status   provider.StatusInfo
+	plan     string
+	recheck  bool
 }
 
-type hitRect struct {
-	id     string
-	x0, x1 int
-	y      int
-}
+type clockTickMsg time.Time
+type usageTickMsg time.Time
+type clearHeaderMsg struct{ seq int }
 
-type boxRect struct {
-	x0, y0, x1, y1 int
-}
-
-var footerKeys = []keyItem{
-	{"↑↓", "move", ""},
-	{"⏎", "switch", "enter"},
-	{"⇥", "tool", "tab"},
-	{"a", "add", "a"},
-	{"d", "remove", "d"},
-	{"u", "usage", "u"},
-	{"b", "rotate", "b"},
-	{"r", "refresh", "r"},
-	{"q", "quit", "q"},
-}
-
-var eighths = []rune{' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'}
-
-// Model is the Bubble Tea model for the Tori interactive TUI.
+// Model is the root Bubble Tea model for the redesigned Tori TUI.
 type Model struct {
 	env       *provider.Env
 	providers []provider.Provider
@@ -106,81 +122,124 @@ type Model struct {
 	errors    map[string]string
 	usageOn   map[string]bool
 
-	cur    int
-	offset int
+	selectedID rowID
+	hoverID    *rowID
+
 	width  int
 	height int
+	layout screenLayout
+	now    time.Time
 
-	statusMsg  string
-	statusTone msgTone
-	loading    bool
+	viewport    viewport.Model
+	rowRanges   []lineRange
+	lineToRow   map[int]int
+	hiddenBelow int
+	footerHits  []footerHit
 
-	modal         modalKind
-	modalProvider provider.Provider
-	modalAccount  *provider.AccountEntry
-	addStep       addStep
-	addStatus     provider.StatusInfo
-	addNotice     string
-	addNoticeErr  bool
-	aliasInput    textinput.Model
+	loading   bool
+	headerMsg headerMsg
+	msgSeq    int
+
+	dlg        dialogState
+	aliasInput textinput.Model
 
 	spinner spinner.Model
-	styles  palette
+	glyphs  glyphs
+	theme   theme
+	keys    keyMap
+	noColor bool
 
-	hoverRow      int
-	hoverFooter   string
-	hoverModalBtn string
-	lastClickRow  int
-	lastClickAt   time.Time
+	lastClickID rowID
+	lastClickAt time.Time
 }
 
-// NewModel initializes the TUI model synchronously from local disk/cache (zero network calls).
+// NewModel initializes the TUI synchronously from local disk/cache (zero network calls).
 func NewModel(env *provider.Env) Model {
 	if env == nil {
 		env = provider.NewEnv()
 	}
-	// Clone env so TUI never prints raw warnings over the alt screen.
 	tuiEnv := *env
 	tuiEnv.Warn = func(string) {}
 
+	ascii := detectASCII(&tuiEnv)
+	noAnim := detectNoAnim(&tuiEnv)
+	g := newGlyphs(ascii, noAnim)
+	th := newTheme(ascii)
+	km := newKeyMap(g)
+
 	sp := spinner.New()
-	sp.Spinner = spinner.MiniDot
+	if ascii {
+		sp.Spinner = spinner.Spinner{
+			Frames: []string{"-", "\\", "|", "/"},
+			FPS:    time.Second / 8,
+		}
+	} else {
+		sp.Spinner = spinner.MiniDot
+	}
+	sp.Style = th.brand
 
 	ti := textinput.New()
-	ti.Placeholder = "optional alias (e.g. work)"
+	ti.Prompt = ""
+	ti.Placeholder = "optional"
 	ti.CharLimit = 40
-	ti.Width = 36
+	ti.Width = 30
+	ti.Cursor.Style = th.inputCursor
+	ti.TextStyle = th.inputText
+	ti.PlaceholderStyle = th.inputPlace
+
+	now := time.Now()
+	if tuiEnv.Now != nil {
+		now = tuiEnv.Now()
+	}
+
+	lay := computeScreenLayout(100, 24)
+	vp := viewport.New(lay.contentW, lay.bodyH)
+	vp.MouseWheelEnabled = false
 
 	m := Model{
-		env:          &tuiEnv,
-		providers:    provider.All(),
-		data:         make(map[string][]provider.AccountEntry),
-		errors:       make(map[string]string),
-		usageOn:      make(map[string]bool),
-		width:        100,
-		height:       30,
-		aliasInput:   ti,
-		spinner:      sp,
-		styles:       newPalette(),
-		hoverRow:     -1,
-		lastClickRow: -1,
+		env:        &tuiEnv,
+		providers:  provider.All(),
+		data:       make(map[string][]provider.AccountEntry),
+		errors:     make(map[string]string),
+		usageOn:    make(map[string]bool),
+		width:      100,
+		height:     24,
+		layout:     lay,
+		now:        now,
+		viewport:   vp,
+		dlg:        dialogState{hoverIdx: -1},
+		aliasInput: ti,
+		spinner:    sp,
+		glyphs:     g,
+		theme:      th,
+		keys:       km,
+		noColor:    detectNoColor(&tuiEnv),
 	}
-	m.styles.spinnerApply(&m.spinner)
 	m.loadLocalData()
+	if m.anyUsageEnabled() && !m.env.DisableNetwork {
+		m.loading = true
+	}
 
-	// Start cursor on the first active account if any.
+	// Start selection on the first active account if any, otherwise the first row.
 	rows := m.rows()
-	for i, r := range rows {
-		if r.account != nil && r.account.Active {
-			m.cur = i
-			break
+	if len(rows) > 0 {
+		m.selectedID = idForRow(rows[0])
+		for _, r := range rows {
+			if r.account != nil && r.account.Active {
+				m.selectedID = idForRow(r)
+				break
+			}
 		}
 	}
+	m.syncViewport()
 	return m
 }
 
-func (p palette) spinnerApply(sp *spinner.Model) {
-	sp.Style = p.accent
+func (m *Model) currentNow() time.Time {
+	if m.env != nil && m.env.Now != nil {
+		return m.env.Now()
+	}
+	return time.Now()
 }
 
 func (m *Model) loadLocalData() {
@@ -208,17 +267,52 @@ func (m Model) shownProviders() []provider.Provider {
 func (m Model) rows() []flatRow {
 	var out []flatRow
 	for _, p := range m.shownProviders() {
+		if m.errors[p.Key()] != "" {
+			out = append(out, flatRow{provider: p, account: nil, loadErr: true})
+			continue
+		}
 		accts := m.data[p.Key()]
-		if len(accts) == 0 || m.errors[p.Key()] != "" {
+		if len(accts) == 0 {
 			out = append(out, flatRow{provider: p, account: nil})
 			continue
 		}
 		for i := range accts {
-			acct := accts[i]
-			out = append(out, flatRow{provider: p, account: &acct})
+			a := accts[i]
+			out = append(out, flatRow{provider: p, account: &a})
 		}
 	}
 	return out
+}
+
+func (m Model) selectedIndex(rows []flatRow) int {
+	if len(rows) == 0 {
+		return -1
+	}
+	// 1. Exact (provider, email) match for accounts.
+	if !m.selectedID.placeholder && m.selectedID.email != "" {
+		for i, r := range rows {
+			if r.provider.Key() == m.selectedID.providerKey && r.account != nil && r.account.Email == m.selectedID.email {
+				return i
+			}
+		}
+	}
+	// 2. Exact (provider, slotNum) match for accounts.
+	if !m.selectedID.placeholder && m.selectedID.slotNum > 0 {
+		for i, r := range rows {
+			if r.provider.Key() == m.selectedID.providerKey && r.account != nil && r.account.Number == m.selectedID.slotNum {
+				return i
+			}
+		}
+	}
+	// 3. First row of the same provider.
+	if m.selectedID.providerKey != "" {
+		for i, r := range rows {
+			if r.provider.Key() == m.selectedID.providerKey {
+				return i
+			}
+		}
+	}
+	return 0
 }
 
 func (m Model) anyUsageEnabled() bool {
@@ -230,18 +324,88 @@ func (m Model) anyUsageEnabled() bool {
 	return false
 }
 
-// Init kicks off async usage fetching if any provider has usage meters enabled.
-func (m Model) Init() tea.Cmd {
-	if !m.anyUsageEnabled() {
-		return nil
+func (m Model) hasReadingRows() bool {
+	if !m.loading {
+		return false
 	}
-	return tea.Batch(
-		m.spinner.Tick,
-		fetchUsageCmd(m.env, m.providers, false, "", ""),
-	)
+	for _, p := range m.providers {
+		if !m.usageOn[p.Key()] {
+			continue
+		}
+		for _, a := range m.data[p.Key()] {
+			if rowState(a, true, true, m.now) == stateReading {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-func fetchUsageCmd(env *provider.Env, providers []provider.Provider, force bool, onlyKey string, note string) tea.Cmd {
+func (m Model) hasOfflineRows() bool {
+	for _, p := range m.providers {
+		if !m.usageOn[p.Key()] {
+			continue
+		}
+		for _, a := range m.data[p.Key()] {
+			if rowState(a, true, m.loading, m.now) == stateOffline {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Init schedules background ticks and starts the initial async usage fetch when meters are on.
+func (m Model) Init() tea.Cmd {
+	cmds := []tea.Cmd{
+		clockTickCmd(),
+		usageTickCmd(),
+	}
+	if m.anyUsageEnabled() {
+		cmds = append(cmds, fetchUsageCmd(m.env, m.providers, false, ""))
+		if !m.glyphs.noAnim {
+			cmds = append(cmds, m.spinner.Tick)
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
+func clockTickCmd() tea.Cmd {
+	return tea.Tick(clockTickInterval, func(t time.Time) tea.Msg {
+		return clockTickMsg(t)
+	})
+}
+
+func usageTickCmd() tea.Cmd {
+	return tea.Tick(usageTickInterval, func(t time.Time) tea.Msg {
+		return usageTickMsg(t)
+	})
+}
+
+func clearHeaderCmd(seq int, d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg {
+		return clearHeaderMsg{seq: seq}
+	})
+}
+
+func (m *Model) setHeaderMsg(kind headerMsgKind, text string) tea.Cmd {
+	m.msgSeq++
+	m.headerMsg = headerMsg{
+		kind: kind,
+		text: text,
+		seq:  m.msgSeq,
+	}
+	switch kind {
+	case msgSuccess, msgInfo:
+		return clearHeaderCmd(m.msgSeq, successMsgTTL)
+	case msgError:
+		return clearHeaderCmd(m.msgSeq, errorMsgTTL)
+	default:
+		return nil
+	}
+}
+
+func fetchUsageCmd(env *provider.Env, providers []provider.Provider, force bool, onlyKey string) tea.Cmd {
 	return func() tea.Msg {
 		targets := make([]provider.Provider, 0, len(providers))
 		for _, p := range providers {
@@ -252,8 +416,12 @@ func fetchUsageCmd(env *provider.Env, providers []provider.Provider, force bool,
 				targets = append(targets, p)
 			}
 		}
+		now := time.Now()
+		if env.Now != nil {
+			now = env.Now()
+		}
 		if len(targets) == 0 {
-			return usageLoadedMsg{note: note, forced: force}
+			return usageLoadedMsg{forced: force, now: now}
 		}
 		results := make([]usageResult, len(targets))
 		var wg sync.WaitGroup
@@ -270,131 +438,156 @@ func fetchUsageCmd(env *provider.Env, providers []provider.Provider, force bool,
 			}(i, p)
 		}
 		wg.Wait()
-		return usageLoadedMsg{results: results, note: note, forced: force}
+		if env.Now != nil {
+			now = env.Now()
+		} else {
+			now = time.Now()
+		}
+		return usageLoadedMsg{results: results, forced: force, now: now}
 	}
 }
 
-func switchCmd(env *provider.Env, p provider.Provider, ref string) tea.Cmd {
+func switchCmd(env *provider.Env, p provider.Provider, slotNum int, email string) tea.Cmd {
 	return func() tea.Msg {
-		var warnBuf []string
 		e := *env
-		e.Warn = func(msg string) { warnBuf = append(warnBuf, msg) }
-		out, err := provider.Switch(&e, p, ref)
+		e.Warn = func(string) {}
+		_, err := provider.Switch(&e, p, fmt.Sprintf("%d", slotNum))
+		now := time.Now()
+		if env.Now != nil {
+			now = env.Now()
+		}
 		if err != nil {
-			return actionDoneMsg{ok: false, text: fmt.Sprintf("%s: %s", p.Title(), err.Error())}
+			return switchDoneMsg{
+				ok:          false,
+				providerKey: p.Key(),
+				email:       email,
+				errText:     err.Error(),
+				now:         now,
+			}
 		}
-		msg := ""
-		if len(out) > 0 {
-			msg = out[0]
-		}
-		if len(warnBuf) > 0 && msg != "" {
-			msg = msg + " (" + warnBuf[0] + ")"
-		}
-		return actionDoneMsg{
-			ok:        true,
-			text:      fmt.Sprintf("%s: %s", p.Title(), msg),
-			refresh:   true,
-			selectKey: p.Key(),
+		return switchDoneMsg{
+			ok:          true,
+			providerKey: p.Key(),
+			email:       email,
+			now:         now,
 		}
 	}
 }
 
-func addCmd(env *provider.Env, p provider.Provider, alias string) tea.Cmd {
+func checkAddStatusCmd(env *provider.Env, p provider.Provider, recheck bool) tea.Cmd {
+	return func() tea.Msg {
+		st, _ := p.Status(env)
+		return addStatusMsg{
+			provider: p,
+			status:   st,
+			recheck:  recheck,
+		}
+	}
+}
+
+func addAccountCmd(env *provider.Env, p provider.Provider, alias string) tea.Cmd {
 	return func() tea.Msg {
 		var args []string
 		if alias = strings.TrimSpace(alias); alias != "" {
 			args = []string{alias}
 		}
 		out, err := p.Add(env, args)
-		if err != nil {
-			return actionDoneMsg{ok: false, text: fmt.Sprintf("%s: %s", p.Title(), err.Error())}
+		now := time.Now()
+		if env.Now != nil {
+			now = env.Now()
 		}
-		msg := ""
-		if len(out) > 0 {
+		if err != nil {
+			return actionDoneMsg{ok: false, text: err.Error(), now: now}
+		}
+		msg := fmt.Sprintf("Saved %s account", p.Title())
+		if len(out) > 0 && out[0] != "" {
 			msg = out[0]
 		}
-		return actionDoneMsg{
-			ok:        true,
-			text:      fmt.Sprintf("%s: %s", p.Title(), msg),
-			refresh:   true,
-			selectKey: p.Key(),
-		}
+		return actionDoneMsg{ok: true, text: msg, refresh: true, selectKey: p.Key(), now: now}
 	}
 }
 
-func removeCmd(env *provider.Env, p provider.Provider, num int, meta provider.AccountEntry) tea.Cmd {
+func removeAccountCmd(env *provider.Env, p provider.Provider, num int, email string) tea.Cmd {
 	return func() tea.Msg {
+		now := time.Now()
+		if env.Now != nil {
+			now = env.Now()
+		}
 		slots, err := p.Slots(env)
 		if err != nil {
-			return actionDoneMsg{ok: false, text: err.Error()}
+			return actionDoneMsg{ok: false, text: err.Error(), now: now}
 		}
 		for _, s := range slots {
 			if s.Number == num {
-				msg, err := provider.Remove(env, p, s)
-				if err != nil {
-					return actionDoneMsg{ok: false, text: err.Error()}
+				if _, err := provider.Remove(env, p, s); err != nil {
+					return actionDoneMsg{ok: false, text: err.Error(), now: now}
 				}
-				return actionDoneMsg{ok: true, text: msg, refresh: true}
+				return actionDoneMsg{ok: true, text: fmt.Sprintf("Removed %s", email), refresh: true, now: now}
 			}
 		}
-		return actionDoneMsg{ok: false, text: fmt.Sprintf("Slot %d (%s) no longer exists.", num, meta.Email)}
+		return actionDoneMsg{ok: false, text: fmt.Sprintf("Slot %d no longer exists", num), now: now}
 	}
 }
 
-func switchAndRemoveCmd(env *provider.Env, p provider.Provider, switchTo int, removeNum int, meta provider.AccountEntry) tea.Cmd {
+func switchAndRemoveCmd(env *provider.Env, p provider.Provider, switchTo, removeNum int, email string) tea.Cmd {
 	return func() tea.Msg {
 		e := *env
 		e.Warn = func(string) {}
-		out, err := provider.Switch(&e, p, fmt.Sprintf("%d", switchTo))
-		if err != nil {
-			return actionDoneMsg{ok: false, text: fmt.Sprintf("%s: %s", p.Title(), err.Error())}
+		now := time.Now()
+		if env.Now != nil {
+			now = env.Now()
+		}
+		if _, err := provider.Switch(&e, p, fmt.Sprintf("%d", switchTo)); err != nil {
+			return actionDoneMsg{ok: false, text: err.Error(), now: now}
 		}
 		slots, err := p.Slots(env)
 		if err != nil {
-			return actionDoneMsg{ok: false, text: err.Error(), refresh: true}
+			return actionDoneMsg{ok: false, text: err.Error(), refresh: true, now: now}
 		}
 		for _, s := range slots {
 			if s.Number == removeNum {
 				if _, err := provider.Remove(env, p, s); err != nil {
-					return actionDoneMsg{ok: false, text: err.Error(), refresh: true}
-				}
-				switched := ""
-				if len(out) > 0 {
-					switched = out[0]
+					return actionDoneMsg{ok: false, text: err.Error(), refresh: true, now: now}
 				}
 				return actionDoneMsg{
 					ok:      true,
-					text:    fmt.Sprintf("%s: %s — removed %s", p.Title(), switched, meta.Email),
+					text:    fmt.Sprintf("Switched and removed %s", email),
 					refresh: true,
+					now:     now,
 				}
 			}
 		}
-		return actionDoneMsg{ok: false, text: fmt.Sprintf("Slot %d (%s) no longer exists.", removeNum, meta.Email), refresh: true}
+		return actionDoneMsg{ok: false, text: fmt.Sprintf("Slot %d no longer exists", removeNum), refresh: true, now: now}
 	}
 }
 
-func removeAndClearCmd(env *provider.Env, p provider.Provider, num int, meta provider.AccountEntry) tea.Cmd {
+func removeAndClearCmd(env *provider.Env, p provider.Provider, num int, email string) tea.Cmd {
 	return func() tea.Msg {
+		now := time.Now()
+		if env.Now != nil {
+			now = env.Now()
+		}
 		slots, err := p.Slots(env)
 		if err != nil {
-			return actionDoneMsg{ok: false, text: err.Error()}
+			return actionDoneMsg{ok: false, text: err.Error(), now: now}
 		}
 		for _, s := range slots {
 			if s.Number == num {
 				if _, err := provider.Remove(env, p, s); err != nil {
-					return actionDoneMsg{ok: false, text: err.Error()}
+					return actionDoneMsg{ok: false, text: err.Error(), now: now}
 				}
 				if _, err := p.ClearLive(env); err != nil {
-					return actionDoneMsg{ok: false, text: fmt.Sprintf("Removed slot %d, but failed to clear local login: %v", num, err), refresh: true}
+					return actionDoneMsg{ok: false, text: fmt.Sprintf("Removed %s, couldn't clear login", email), refresh: true, now: now}
 				}
 				return actionDoneMsg{
 					ok:      true,
-					text:    fmt.Sprintf("%s: removed %s and cleared local login", p.Title(), meta.Email),
+					text:    fmt.Sprintf("Removed %s and cleared login", email),
 					refresh: true,
+					now:     now,
 				}
 			}
 		}
-		return actionDoneMsg{ok: false, text: fmt.Sprintf("Slot %d (%s) no longer exists.", num, meta.Email)}
+		return actionDoneMsg{ok: false, text: fmt.Sprintf("Slot %d no longer exists", num), now: now}
 	}
 }
 
@@ -402,31 +595,29 @@ func rotateAllCmd(env *provider.Env, providers []provider.Provider) tea.Cmd {
 	return func() tea.Msg {
 		e := *env
 		e.Warn = func(string) {}
-		var msgs []string
-		okAll := true
+		now := time.Now()
+		if env.Now != nil {
+			now = env.Now()
+		}
 		rotated := 0
+		var failed []string
 		for _, p := range providers {
 			slots, _ := p.Slots(&e)
 			if len(slots) < 2 {
 				continue
 			}
 			rotated++
-			out, err := provider.Switch(&e, p, "")
-			if err != nil {
-				okAll = false
-				msgs = append(msgs, fmt.Sprintf("%s: %s", p.Title(), err.Error()))
-			} else if len(out) > 0 {
-				msgs = append(msgs, fmt.Sprintf("%s: %s", p.Title(), out[0]))
+			if _, err := provider.Switch(&e, p, ""); err != nil {
+				failed = append(failed, fmt.Sprintf("%s: %s", p.Title(), err.Error()))
 			}
 		}
 		if rotated == 0 {
-			return actionDoneMsg{ok: false, text: "Need at least 2 accounts in a tool to rotate."}
+			return actionDoneMsg{ok: false, text: "Need at least 2 accounts to rotate", now: now}
 		}
-		return actionDoneMsg{
-			ok:      okAll,
-			text:    strings.Join(msgs, " | "),
-			refresh: true,
+		if len(failed) > 0 {
+			return actionDoneMsg{ok: false, text: strings.Join(failed, "; "), refresh: true, now: now}
 		}
+		return actionDoneMsg{ok: true, text: "Rotated all tools", refresh: true, now: now}
 	}
 }
 
@@ -436,19 +627,55 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.syncScroll()
+		m.layout = computeScreenLayout(m.width, m.height)
+		m.viewport.Width = max(1, m.layout.contentW)
+		m.viewport.Height = max(1, m.layout.bodyH)
+		m.syncViewport()
+		return m, nil
+
+	case clockTickMsg:
+		m.now = m.currentNow()
+		m.syncViewport()
+		return m, clockTickCmd()
+
+	case usageTickMsg:
+		m.now = m.currentNow()
+		if !m.loading && m.anyUsageEnabled() {
+			m.loading = true
+			cmds := []tea.Cmd{
+				usageTickCmd(),
+				fetchUsageCmd(m.env, m.providers, false, ""),
+			}
+			if !m.glyphs.noAnim && m.hasReadingRows() {
+				cmds = append(cmds, m.spinner.Tick)
+			}
+			m.syncViewport()
+			return m, tea.Batch(cmds...)
+		}
+		return m, usageTickCmd()
+
+	case clearHeaderMsg:
+		if m.headerMsg.seq == msg.seq {
+			m.headerMsg = headerMsg{}
+		}
 		return m, nil
 
 	case spinner.TickMsg:
-		if !m.loading && m.statusMsg == "" {
+		if !m.loading || m.glyphs.noAnim {
 			return m, nil
 		}
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
+		if m.hasReadingRows() {
+			m.syncViewport()
+		}
 		return m, cmd
 
 	case usageLoadedMsg:
 		m.loading = false
+		if !msg.now.IsZero() {
+			m.now = msg.now
+		}
 		for _, res := range msg.results {
 			if res.err != "" {
 				m.errors[res.key] = res.err
@@ -458,509 +685,566 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.data[res.key] = res.accounts
 			}
 		}
-		if msg.note != "" {
-			m.statusMsg = msg.note
-			m.statusTone = toneGreen
-		} else if msg.forced {
-			total, throttled, errThrottled, rateLimited := 0, 0, 0, 0
-			minWait, maxErrWait := 0, 0
-			for _, res := range msg.results {
-				for _, a := range res.accounts {
-					if a.Usage == nil {
-						continue
-					}
-					total++
-					if a.Usage.Throttled {
-						throttled++
-						w := 0
-						if a.Usage.RetryAfterSeconds != nil {
-							w = *a.Usage.RetryAfterSeconds
-						}
-						if w > 0 && (minWait == 0 || w < minWait) {
-							minWait = w
-						}
-						if a.Usage.Error != nil && *a.Usage.Error != "" {
-							errThrottled++
-							if *a.Usage.Error == "rate limited" {
-								rateLimited++
-							}
-							if w > maxErrWait {
-								maxErrWait = w
-							}
-						}
-					}
-				}
-			}
-			switch {
-			case total > 0 && throttled == total && errThrottled > 0:
-				wait := maxErrWait
-				if wait == 0 {
-					wait = minWait
-				}
-				if rateLimited == errThrottled {
-					m.statusMsg = fmt.Sprintf("Rate limited — retry in %s", provider.FmtWait(wait))
-				} else {
-					m.statusMsg = fmt.Sprintf("Usage on cooldown — retry in %s", provider.FmtWait(wait))
-				}
-				m.statusTone = toneYellow
-			case total > 0 && throttled == total:
-				m.statusMsg = fmt.Sprintf("Usage refreshed recently — retry in %s", provider.FmtWait(minWait))
-				m.statusTone = toneYellow
-			case throttled > 0:
-				m.statusMsg = "Refreshed (some accounts on cooldown)"
-				m.statusTone = toneYellow
-			case strings.HasPrefix(m.statusMsg, "Reading") || strings.HasPrefix(m.statusMsg, "Refreshing"):
-				m.statusMsg = ""
-			}
-		} else if strings.HasPrefix(m.statusMsg, "Reading") || strings.HasPrefix(m.statusMsg, "Refreshing") {
-			m.statusMsg = ""
-		}
-		m.clampCursor()
-		m.syncScroll()
+		m.reconcileSelection()
+		m.syncViewport()
 		return m, nil
 
+	case switchDoneMsg:
+		if !msg.now.IsZero() {
+			m.now = msg.now
+		}
+		m.loadLocalData()
+		m.reconcileSelection()
+		m.syncViewport()
+		if msg.ok {
+			return m, m.setHeaderMsg(msgSuccess, fmt.Sprintf("Switched to %s", msg.email))
+		}
+		return m, m.setHeaderMsg(msgError, fmt.Sprintf("couldn't switch %s %s", m.glyphs.sep, msg.errText))
+
 	case actionDoneMsg:
+		if !msg.now.IsZero() {
+			m.now = msg.now
+		}
 		if msg.refresh {
 			m.loadLocalData()
-			m.clampCursor()
-			m.syncScroll()
+			m.reconcileSelection()
+			m.syncViewport()
 		}
-		m.statusMsg = msg.text
 		if msg.ok {
-			m.statusTone = toneGreen
-		} else {
-			m.statusTone = toneRed
+			var cmds []tea.Cmd
+			if c := m.setHeaderMsg(msgSuccess, msg.text); c != nil {
+				cmds = append(cmds, c)
+			}
+			if msg.selectKey != "" && m.usageOn[msg.selectKey] {
+				m.loading = true
+				cmds = append(cmds, fetchUsageCmd(m.env, m.providers, false, msg.selectKey))
+				if !m.glyphs.noAnim {
+					cmds = append(cmds, m.spinner.Tick)
+				}
+			}
+			return m, tea.Batch(cmds...)
 		}
-		return m, nil
+		return m, m.setHeaderMsg(msgError, msg.text)
+
+	case addStatusMsg:
+		return m.handleAddStatus(msg)
 
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 
 	case tea.KeyMsg:
-		if msg.String() == "ctrl+c" {
+		if key.Matches(msg, m.keys.ForceQuit) {
 			return m, tea.Quit
 		}
-		if m.modal != modalNone {
-			return m.handleModalKey(msg)
+		if m.dlg.kind != dialogNone {
+			return m.handleDialogKey(msg)
 		}
 		return m.handleMainKey(msg)
 	}
 	return m, nil
 }
 
-func (m Model) nextOtherAccount(pKey string, excludeNum int) *provider.AccountEntry {
-	accts := m.data[pKey]
-	if len(accts) < 2 {
-		return nil
+func (m *Model) reconcileSelection() {
+	rows := m.rows()
+	idx := m.selectedIndex(rows)
+	if idx >= 0 && idx < len(rows) {
+		m.selectedID = idForRow(rows[idx])
 	}
-	// Prefer the next slot after excludeNum, wrapping around.
-	for _, a := range accts {
-		if a.Number > excludeNum {
-			cp := a
-			return &cp
-		}
-	}
-	for _, a := range accts {
-		if a.Number != excludeNum {
-			cp := a
-			return &cp
-		}
-	}
-	return nil
 }
 
-func (m Model) cancelAddModal() (Model, tea.Cmd) {
-	m.modal = modalNone
-	m.hoverModalBtn = ""
-	m.aliasInput.Blur()
-	m.addNotice = ""
-	m.addNoticeErr = false
-	m.statusMsg = "Cancelled."
-	m.statusTone = toneYellow
-	return m, nil
-}
+func (m Model) handleAddStatus(msg addStatusMsg) (Model, tea.Cmd) {
+	st := msg.status
+	m.dlg.provider = msg.provider
+	m.dlg.status = st
+	m.dlg.cursor = 0
+	m.dlg.hoverIdx = -1
 
-func (m Model) recheckAddStatus() (Model, tea.Cmd) {
-	p := m.modalProvider
-	st, _ := p.Status(m.env)
-	m.addStatus = st
-	m.loadLocalData()
+	// Case 1: Signed in to an unsaved account -> go directly to Step 4 (Save).
 	if st.LoggedIn && st.ManagedSlot == nil {
-		m.addStep = addStepSave
-		m.addNotice = ""
-		m.addNoticeErr = false
+		m.dlg.kind = dialogAddSave
+		m.dlg.stillSameLogin = false
+		m.dlg.account = nil
 		m.aliasInput.Reset()
-		cmd := m.aliasInput.Focus()
-		return m, cmd
+		return m, m.aliasInput.Focus()
 	}
+
+	// Case 2: Signed in to an already-saved slot.
 	if st.LoggedIn && st.ManagedSlot != nil {
-		m.addNotice = fmt.Sprintf("Still signed in as %s (already slot %d). Log out and sign in to a different account first.", st.DisplayName, *st.ManagedSlot)
-		m.addNoticeErr = false
-		return m, nil
-	}
-	m.addNotice = "No signed-in account found yet. Sign in first, then press r (Re-check)."
-	m.addNoticeErr = false
-	return m, nil
-}
-
-func (m Model) cycleAddProvider(delta int) (Model, tea.Cmd) {
-	if len(m.providers) == 0 {
-		return m, nil
-	}
-	idx := 0
-	if m.modalProvider != nil {
-		for i, prov := range m.providers {
-			if prov.Key() == m.modalProvider.Key() {
-				idx = i
-				break
-			}
-		}
-	}
-	nextIdx := (idx + delta + len(m.providers)) % len(m.providers)
-	return m.openAddModal(m.providers[nextIdx])
-}
-
-func (m Model) triggerModalAction(id string) (tea.Model, tea.Cmd) {
-	m.hoverModalBtn = ""
-	switch m.modal {
-	case modalAdd:
-		if key, ok := strings.CutPrefix(id, "tab:"); ok {
-			for _, prov := range m.providers {
-				if prov.Key() == key {
-					return m.openAddModal(prov)
-				}
-			}
-			return m, nil
-		}
-		if m.addStep == addStepSave {
-			switch id {
-			case "cancel":
-				return m.cancelAddModal()
-			case "save":
-				alias := m.aliasInput.Value()
-				p := m.modalProvider
-				m.modal = modalNone
-				m.aliasInput.Blur()
-				m.addNotice = ""
-				m.addNoticeErr = false
-				m.statusMsg = "Saving account..."
-				m.statusTone = toneYellow
-				return m, addCmd(m.env, p, alias)
-			}
-			return m, nil
-		}
-
-		switch id {
-		case "cancel":
-			return m.cancelAddModal()
-		case "recheck":
-			return m.recheckAddStatus()
-		case "update":
-			if m.addStatus.ManagedSlot != nil {
-				m.addStep = addStepSave
-				m.addNotice = ""
-				m.addNoticeErr = false
-				m.aliasInput.Reset()
-				cmd := m.aliasInput.Focus()
-				return m, cmd
-			}
-		}
-
-	case modalDelete:
-		switch id {
-		case "remove":
-			p := m.modalProvider
-			acct := *m.modalAccount
-			m.modal = modalNone
-			m.modalAccount = nil
-			return m, removeCmd(m.env, p, acct.Number, acct)
-		case "switch_remove":
-			if m.modalAccount != nil && m.modalAccount.Active {
-				if other := m.nextOtherAccount(m.modalProvider.Key(), m.modalAccount.Number); other != nil {
-					p := m.modalProvider
-					acct := *m.modalAccount
-					m.modal = modalNone
-					m.modalAccount = nil
-					m.statusMsg = "Switching & removing..."
-					m.statusTone = toneYellow
-					return m, switchAndRemoveCmd(m.env, p, other.Number, acct.Number, acct)
-				}
-			}
-		case "remove_clear":
-			if m.modalAccount != nil && m.modalAccount.Active && len(m.data[m.modalProvider.Key()]) == 1 {
-				p := m.modalProvider
-				acct := *m.modalAccount
-				m.modal = modalNone
-				m.modalAccount = nil
-				m.statusMsg = "Removing & clearing local login..."
-				m.statusTone = toneYellow
-				return m, removeAndClearCmd(m.env, p, acct.Number, acct)
-			}
-		case "cancel":
-			m.modal = modalNone
-			m.modalAccount = nil
-			m.statusMsg = "Cancelled."
-			m.statusTone = toneYellow
-			return m, nil
-		}
-
-	case modalDisclaimer:
-		switch id {
-		case "accept":
-			p := m.modalProvider
-			m.modal = modalNone
-			if err := config.SetUsage(m.env.Root, []string{p.Key()}, true); err != nil {
-				m.statusMsg = err.Error()
-				m.statusTone = toneRed
+		slotN := *st.ManagedSlot
+		if msg.recheck {
+			// If still signed in to the exact same saved slot we started with,
+			// stay on Step 2 and show the warning.
+			if m.dlg.initialSlot != nil && *m.dlg.initialSlot == slotN {
+				m.dlg.kind = dialogAddSignIn
+				m.dlg.stillSameLogin = true
 				return m, nil
 			}
-			m.usageOn[p.Key()] = true
-			m.loadLocalData()
-			m.loading = true
-			m.statusMsg = fmt.Sprintf("%s: usage meters on, reading usage…", p.Title())
-			m.statusTone = toneYellow
-			return m, tea.Batch(
-				m.spinner.Tick,
-				fetchUsageCmd(m.env, m.providers, false, p.Key(), fmt.Sprintf("%s: usage meters on", p.Title())),
-			)
-		case "cancel":
-			m.modal = modalNone
-			m.statusMsg = "Cancelled."
-			m.statusTone = toneYellow
+			// Signed in to a different saved slot -> Step 3 (Already saved).
+			m.dlg.kind = dialogAddAlreadySaved
+			m.dlg.stillSameLogin = false
 			return m, nil
 		}
-	}
-	return m, nil
-}
 
-func (m Model) handleModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch m.modal {
-	case modalAdd:
-		if m.addStep == addStepSave {
-			switch msg.String() {
-			case "esc":
-				return m.triggerModalAction("cancel")
-			case "enter":
-				return m.triggerModalAction("save")
-			case "tab":
-				return m.cycleAddProvider(1)
-			case "shift+tab":
-				return m.cycleAddProvider(-1)
-			case "left":
-				if m.aliasInput.Value() == "" {
-					return m.cycleAddProvider(-1)
-				}
-				var cmd tea.Cmd
-				m.aliasInput, cmd = m.aliasInput.Update(msg)
-				return m, cmd
-			case "right":
-				if m.aliasInput.Value() == "" {
-					return m.cycleAddProvider(1)
-				}
-				var cmd tea.Cmd
-				m.aliasInput, cmd = m.aliasInput.Update(msg)
-				return m, cmd
-			default:
-				var cmd tea.Cmd
-				m.aliasInput, cmd = m.aliasInput.Update(msg)
-				return m, cmd
+		// Initial open from Step 1: if the currently selected row is this slot
+		// AND its login was expired, offer Step 3 (Update slot) immediately.
+		for _, a := range m.data[msg.provider.Key()] {
+			if a.Number == slotN && rowState(a, m.usageOn[msg.provider.Key()], m.loading, m.now) == stateLoginExpired {
+				m.dlg.kind = dialogAddAlreadySaved
+				m.dlg.stillSameLogin = false
+				return m, nil
 			}
 		}
 
-		switch msg.String() {
-		case "esc":
-			return m.triggerModalAction("cancel")
-		case "left", "h", "shift+tab":
-			return m.cycleAddProvider(-1)
-		case "right", "l", "tab":
-			return m.cycleAddProvider(1)
-		case "r", "R", "enter":
-			return m.triggerModalAction("recheck")
-		case "s", "S":
-			return m.triggerModalAction("update")
-		}
+		// Otherwise show Step 2 (Sign in with a new account) and remember this slot.
+		cp := slotN
+		m.dlg.initialSlot = &cp
+		m.dlg.kind = dialogAddSignIn
+		m.dlg.stillSameLogin = false
+		return m, nil
+	}
 
-	case modalDelete:
-		switch msg.String() {
-		case "y", "Y":
-			return m.triggerModalAction("remove")
-		case "s", "S":
-			return m.triggerModalAction("switch_remove")
-		case "c", "C":
-			return m.triggerModalAction("remove_clear")
-		case "n", "N", "esc":
-			return m.triggerModalAction("cancel")
-		}
-
-	case modalDisclaimer:
-		switch msg.String() {
-		case "y", "Y", "enter":
-			return m.triggerModalAction("accept")
-		case "n", "N", "esc":
-			return m.triggerModalAction("cancel")
-		}
+	// Case 3: Not signed in yet -> Step 2 (Sign in).
+	m.dlg.kind = dialogAddSignIn
+	if !msg.recheck {
+		m.dlg.initialSlot = nil
+		m.dlg.stillSameLogin = false
 	}
 	return m, nil
 }
 
 func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	flat := m.rows()
-	n := len(flat)
+	rows := m.rows()
+	n := len(rows)
+	cur := m.selectedIndex(rows)
 
-	switch msg.String() {
-	case "q", "esc":
+	switch {
+	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
 
-	case "down", "j":
-		if n > 0 {
-			m.cur = (m.cur + 1) % n
-			m.syncScroll()
+	case key.Matches(msg, m.keys.Help):
+		m.dlg.close()
+		m.dlg.kind = dialogHelp
+		return m, nil
+
+	case key.Matches(msg, m.keys.Down):
+		if n > 0 && cur < n-1 {
+			m.selectedID = idForRow(rows[cur+1])
+			m.syncViewport()
 		}
 		return m, nil
 
-	case "up", "k":
-		if n > 0 {
-			m.cur = (m.cur - 1 + n) % n
-			m.syncScroll()
+	case key.Matches(msg, m.keys.Up):
+		if n > 0 && cur > 0 {
+			m.selectedID = idForRow(rows[cur-1])
+			m.syncViewport()
 		}
 		return m, nil
 
-	case "tab":
-		if n > 0 {
+	case key.Matches(msg, m.keys.NextTool):
+		if n > 0 && cur >= 0 {
 			shown := m.shownProviders()
-			curKey := flat[m.cur].provider.Key()
-			curIdx := 0
+			curKey := rows[cur].provider.Key()
+			curToolIdx := 0
 			for i, p := range shown {
 				if p.Key() == curKey {
-					curIdx = i
+					curToolIdx = i
 					break
 				}
 			}
-			targetKey := shown[(curIdx+1)%len(shown)].Key()
-			for i, r := range flat {
-				if r.provider.Key() == targetKey {
-					m.cur = i
+			nextKey := shown[(curToolIdx+1)%len(shown)].Key()
+			for _, r := range rows {
+				if r.provider.Key() == nextKey {
+					m.selectedID = idForRow(r)
 					break
 				}
 			}
-			m.syncScroll()
+			m.syncViewport()
 		}
 		return m, nil
 
-	case "enter":
-		if n == 0 {
+	case key.Matches(msg, m.keys.Switch):
+		if n == 0 || cur < 0 {
 			return m, nil
 		}
-		row := flat[m.cur]
-		if row.account == nil {
-			return m.openAddModal(row.provider)
-		}
-		if row.account.Active {
-			m.statusMsg = fmt.Sprintf("%s: already on %s", row.provider.Title(), row.account.Email)
-			m.statusTone = toneYellow
-			return m, nil
-		}
-		m.statusMsg = "Switching..."
-		m.statusTone = toneYellow
-		return m, switchCmd(m.env, row.provider, fmt.Sprintf("%d", row.account.Number))
+		return m.activateRow(rows[cur])
 
-	case "a":
-		if n == 0 {
-			return m, nil
-		}
-		return m.openAddModal(flat[m.cur].provider)
+	case key.Matches(msg, m.keys.Add):
+		return m.openAddPickTool(rows, cur)
 
-	case "d", "delete":
-		if n == 0 {
+	case key.Matches(msg, m.keys.Remove):
+		if n == 0 || cur < 0 || rows[cur].account == nil {
 			return m, nil
 		}
-		row := flat[m.cur]
-		if row.account == nil {
-			m.statusMsg = "Nothing to remove here."
-			m.statusTone = toneYellow
-			return m, nil
-		}
-		acctCopy := *row.account
-		m.modal = modalDelete
-		m.modalProvider = row.provider
-		m.modalAccount = &acctCopy
-		m.hoverModalBtn = ""
-		return m, nil
+		return m.openRemoveDialog(rows[cur].provider, *rows[cur].account), nil
 
-	case "u":
-		if n == 0 {
+	case key.Matches(msg, m.keys.Meters):
+		if n == 0 || cur < 0 {
 			return m, nil
 		}
-		p := flat[m.cur].provider
+		p := rows[cur].provider
 		if m.usageOn[p.Key()] {
 			if err := config.SetUsage(m.env.Root, []string{p.Key()}, false); err != nil {
-				m.statusMsg = err.Error()
-				m.statusTone = toneRed
-				return m, nil
+				return m, m.setHeaderMsg(msgError, err.Error())
 			}
 			m.usageOn[p.Key()] = false
 			m.loadLocalData()
-			m.statusMsg = fmt.Sprintf("%s: usage meters off", p.Title())
-			m.statusTone = toneYellow
-			return m, nil
+			m.reconcileSelection()
+			m.syncViewport()
+			return m, m.setHeaderMsg(msgSuccess, fmt.Sprintf("Meters off for %s", p.Title()))
 		}
-		m.modal = modalDisclaimer
-		m.modalProvider = p
-		m.hoverModalBtn = ""
+		m.dlg.close()
+		m.dlg.kind = dialogMetersOn
+		m.dlg.provider = p
+		m.dlg.cursor = 0 // safe default: Turn on for standard, Not now for Antigravity
 		return m, nil
 
-	case "b":
-		m.statusMsg = "Rotating accounts..."
-		m.statusTone = toneYellow
+	case key.Matches(msg, m.keys.Rotate):
 		return m, rotateAllCmd(m.env, m.providers)
 
-	case "r":
+	case key.Matches(msg, m.keys.Refresh):
+		// Reload any errored tools locally first.
+		m.loadLocalData()
+		m.reconcileSelection()
 		if !m.anyUsageEnabled() {
-			m.statusMsg = "Usage meters are off; press u to turn them on."
-			m.statusTone = toneYellow
-			return m, nil
+			m.syncViewport()
+			return m, m.setHeaderMsg(msgInfo, fmt.Sprintf("Meters off %s press u to turn on", m.glyphs.sep))
 		}
 		if m.loading {
-			m.statusMsg = "Usage refresh already in progress..."
-			m.statusTone = toneYellow
 			return m, nil
 		}
 		m.loading = true
-		m.statusMsg = "Refreshing usage..."
-		m.statusTone = toneYellow
-		return m, tea.Batch(
-			m.spinner.Tick,
-			fetchUsageCmd(m.env, m.providers, true, "", ""),
-		)
+		m.syncViewport()
+		cmds := []tea.Cmd{fetchUsageCmd(m.env, m.providers, true, "")}
+		if !m.glyphs.noAnim && m.hasReadingRows() {
+			cmds = append(cmds, m.spinner.Tick)
+		}
+		return m, tea.Batch(cmds...)
 	}
 	return m, nil
 }
 
-func (m Model) openAddModal(p provider.Provider) (Model, tea.Cmd) {
-	st, _ := p.Status(m.env)
-	m.modal = modalAdd
-	m.modalProvider = p
-	m.addStatus = st
-	m.addNotice = ""
-	m.addNoticeErr = false
-	m.hoverModalBtn = ""
-	m.aliasInput.Reset()
-	if p.Key() == "antigravity" {
-		m.aliasInput.Placeholder = "alias (optional, e.g. primary)"
-	} else {
-		m.aliasInput.Placeholder = "optional alias (Enter for none)"
+func (m Model) activateRow(row flatRow) (Model, tea.Cmd) {
+	if row.loadErr {
+		m.loadLocalData()
+		m.reconcileSelection()
+		m.syncViewport()
+		return m, nil
 	}
-	if st.LoggedIn && st.ManagedSlot == nil {
-		m.addStep = addStepSave
-		cmd := m.aliasInput.Focus()
+	if row.account == nil {
+		// Empty tool -> jump directly to checking status for this tool.
+		m.dlg.close()
+		m.dlg.provider = row.provider
+		return m, checkAddStatusCmd(m.env, row.provider, false)
+	}
+	if row.account.Active {
+		return m, m.setHeaderMsg(msgInfo, "Already active")
+	}
+
+	// Optimistic update: move active dot immediately; switchDoneMsg reconciles or rolls back.
+	accts := m.data[row.provider.Key()]
+	updated := make([]provider.AccountEntry, len(accts))
+	for i, a := range accts {
+		a.Active = a.Number == row.account.Number
+		updated[i] = a
+	}
+	m.data[row.provider.Key()] = updated
+	m.syncViewport()
+
+	return m, switchCmd(m.env, row.provider, row.account.Number, row.account.Email)
+}
+
+func (m Model) openAddPickTool(rows []flatRow, cur int) (Model, tea.Cmd) {
+	m.dlg.close()
+	m.dlg.kind = dialogAddPickTool
+	// Default cursor to currently selected tool.
+	if cur >= 0 && cur < len(rows) {
+		curKey := rows[cur].provider.Key()
+		for i, p := range m.providers {
+			if p.Key() == curKey {
+				m.dlg.cursor = i
+				break
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m Model) openRemoveDialog(p provider.Provider, acct provider.AccountEntry) Model {
+	m.dlg.close()
+	acctCopy := acct
+	m.dlg.kind = dialogRemove
+	m.dlg.provider = p
+	m.dlg.account = &acctCopy
+
+	accts := m.data[p.Key()]
+	m.dlg.onlyAccount = len(accts) <= 1
+	if acct.Active && len(accts) > 1 {
+		m.dlg.otherSlot = nextOtherSlot(accts, acct.Number)
+	}
+
+	// Safe default selection: never a destructive choice.
+	switch {
+	case !acct.Active:
+		m.dlg.cursor = 0 // Cancel
+	case !m.dlg.onlyAccount && m.dlg.otherSlot > 0:
+		m.dlg.cursor = 0 // Switch to slot N, then remove
+	default:
+		m.dlg.cursor = 2 // Cancel (choices are Remove only, Remove and clear login, Cancel)
+	}
+	return m
+}
+
+func nextOtherSlot(accts []provider.AccountEntry, exclude int) int {
+	for _, a := range accts {
+		if a.Number > exclude {
+			return a.Number
+		}
+	}
+	for _, a := range accts {
+		if a.Number != exclude {
+			return a.Number
+		}
+	}
+	return 0
+}
+
+func (m Model) handleDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, m.keys.Back) {
+		m.aliasInput.Blur()
+		m.dlg.close()
+		return m, nil
+	}
+
+	switch m.dlg.kind {
+	case dialogHelp:
+		if key.Matches(msg, m.keys.Help) || key.Matches(msg, m.keys.Switch) || key.Matches(msg, m.keys.Quit) {
+			m.dlg.close()
+		}
+		return m, nil
+
+	case dialogAddSignIn:
+		if key.Matches(msg, m.keys.Switch) {
+			return m, checkAddStatusCmd(m.env, m.dlg.provider, true)
+		}
+		return m, nil
+
+	case dialogAddSave:
+		if key.Matches(msg, m.keys.Switch) {
+			p := m.dlg.provider
+			alias := m.aliasInput.Value()
+			m.aliasInput.Blur()
+			m.dlg.close()
+			return m, addAccountCmd(m.env, p, alias)
+		}
+		var cmd tea.Cmd
+		m.aliasInput, cmd = m.aliasInput.Update(msg)
 		return m, cmd
+
+	default:
+		choices := m.dialogChoices()
+		if len(choices) == 0 {
+			return m, nil
+		}
+		switch {
+		case key.Matches(msg, m.keys.Down):
+			m.dlg.cursor = (m.dlg.cursor + 1) % len(choices)
+			return m, nil
+		case key.Matches(msg, m.keys.Up):
+			m.dlg.cursor = (m.dlg.cursor - 1 + len(choices)) % len(choices)
+			return m, nil
+		case key.Matches(msg, m.keys.Switch):
+			if m.dlg.cursor >= 0 && m.dlg.cursor < len(choices) {
+				return m.executeDialogChoice(choices[m.dlg.cursor].id)
+			}
+		}
 	}
-	m.addStep = addStepGuide
-	m.aliasInput.Blur()
 	return m, nil
 }
 
-func keyFromAction(action string) tea.KeyMsg {
+func (m Model) executeDialogChoice(id string) (tea.Model, tea.Cmd) {
+	if id == "cancel" {
+		m.aliasInput.Blur()
+		m.dlg.close()
+		return m, nil
+	}
+
+	switch m.dlg.kind {
+	case dialogAddPickTool:
+		if keyName, ok := strings.CutPrefix(id, "tool:"); ok {
+			for _, p := range m.providers {
+				if p.Key() == keyName {
+					m.dlg.provider = p
+					return m, checkAddStatusCmd(m.env, p, false)
+				}
+			}
+		}
+
+	case dialogAddAlreadySaved:
+		if id == "update" {
+			p := m.dlg.provider
+			m.dlg.close()
+			return m, addAccountCmd(m.env, p, "")
+		}
+
+	case dialogRemove:
+		if m.dlg.account == nil || m.dlg.provider == nil {
+			m.dlg.close()
+			return m, nil
+		}
+		p := m.dlg.provider
+		acct := *m.dlg.account
+		other := m.dlg.otherSlot
+		m.dlg.close()
+		switch id {
+		case "remove":
+			return m, removeAccountCmd(m.env, p, acct.Number, acct.Email)
+		case "switch_remove":
+			return m, switchAndRemoveCmd(m.env, p, other, acct.Number, acct.Email)
+		case "remove_clear":
+			return m, removeAndClearCmd(m.env, p, acct.Number, acct.Email)
+		}
+
+	case dialogMetersOn:
+		if id == "enable" && m.dlg.provider != nil {
+			p := m.dlg.provider
+			m.dlg.close()
+			if err := config.SetUsage(m.env.Root, []string{p.Key()}, true); err != nil {
+				return m, m.setHeaderMsg(msgError, err.Error())
+			}
+			m.usageOn[p.Key()] = true
+			m.loadLocalData()
+			m.loading = true
+			m.reconcileSelection()
+			m.syncViewport()
+			cmds := []tea.Cmd{
+				fetchUsageCmd(m.env, m.providers, false, p.Key()),
+				m.setHeaderMsg(msgSuccess, fmt.Sprintf("Meters on for %s", p.Title())),
+			}
+			if !m.glyphs.noAnim {
+				cmds = append(cmds, m.spinner.Tick)
+			}
+			return m, tea.Batch(cmds...)
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.layout.mode == layoutTooSmall {
+		return m, nil
+	}
+
+	if m.dlg.kind != dialogNone {
+		_, hits, rect := m.buildDialog()
+		switch {
+		case msg.Action == tea.MouseActionMotion:
+			m.dlg.hoverIdx = -1
+			for i, h := range hits {
+				if msg.Y == h.y && msg.X >= h.x0 && msg.X < h.x1 {
+					m.dlg.hoverIdx = i
+					break
+				}
+			}
+			return m, nil
+
+		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+			for i, h := range hits {
+				if msg.Y == h.y && msg.X >= h.x0 && msg.X < h.x1 {
+					m.dlg.cursor = i
+					return m.executeDialogChoice(h.id)
+				}
+			}
+			if msg.X < rect.x0 || msg.X >= rect.x1 || msg.Y < rect.y0 || msg.Y >= rect.y1 {
+				m.aliasInput.Blur()
+				m.dlg.close()
+			}
+		}
+		return m, nil
+	}
+
+	rows := m.rows()
+	if len(rows) == 0 {
+		return m, nil
+	}
+	bodyTop := 2
+	bodyEnd := bodyTop + m.layout.bodyH
+	footerY := bodyEnd
+
+	switch {
+	case msg.Action == tea.MouseActionMotion:
+		var nextHover *rowID
+		if msg.Y >= bodyTop && msg.Y < bodyEnd {
+			listLine := (msg.Y - bodyTop) + m.viewport.YOffset
+			if idx, ok := m.lineToRow[listLine]; ok && idx >= 0 && idx < len(rows) {
+				id := idForRow(rows[idx])
+				nextHover = &id
+			}
+		}
+		if !sameHover(m.hoverID, nextHover) {
+			m.hoverID = nextHover
+			m.syncViewport()
+		}
+		return m, nil
+
+	case msg.Button == tea.MouseButtonWheelUp && msg.Action == tea.MouseActionPress:
+		cur := m.selectedIndex(rows)
+		if cur > 0 {
+			m.selectedID = idForRow(rows[cur-1])
+			m.syncViewport()
+		}
+		return m, nil
+
+	case msg.Button == tea.MouseButtonWheelDown && msg.Action == tea.MouseActionPress:
+		cur := m.selectedIndex(rows)
+		if cur >= 0 && cur < len(rows)-1 {
+			m.selectedID = idForRow(rows[cur+1])
+			m.syncViewport()
+		}
+		return m, nil
+
+	case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+		if msg.Y == footerY {
+			for _, fh := range m.footerHits {
+				if msg.X >= fh.x0 && msg.X < fh.x1 && fh.action != "" {
+					return m.handleMainKey(keyMsgFromAction(fh.action))
+				}
+			}
+			return m, nil
+		}
+		if msg.Y < bodyTop || msg.Y >= bodyEnd {
+			return m, nil
+		}
+		listLine := (msg.Y - bodyTop) + m.viewport.YOffset
+		idx, ok := m.lineToRow[listLine]
+		if !ok || idx < 0 || idx >= len(rows) {
+			return m, nil
+		}
+		clickedID := idForRow(rows[idx])
+		now := m.currentNow()
+		isDouble := m.lastClickID == clickedID && now.Sub(m.lastClickAt) < 450*time.Millisecond
+		m.selectedID = clickedID
+		m.lastClickID = clickedID
+		m.lastClickAt = now
+		m.syncViewport()
+
+		if isDouble {
+			return m.activateRow(rows[idx])
+		}
+	}
+	return m, nil
+}
+
+func sameHover(a, b *rowID) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+func keyMsgFromAction(action string) tea.KeyMsg {
 	switch action {
 	case "enter":
 		return tea.KeyMsg{Type: tea.KeyEnter}
@@ -971,978 +1255,236 @@ func keyFromAction(action string) tea.KeyMsg {
 	}
 }
 
-func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	// Modal mouse hover & click handling.
-	if m.modal != modalNone {
-		_, hits, boxR := m.buildModal()
-		switch {
-		case msg.Action == tea.MouseActionMotion:
-			hovered := ""
-			for _, h := range hits {
-				if msg.Y == h.y && msg.X >= h.x0 && msg.X < h.x1 {
-					hovered = h.id
-					break
-				}
-			}
-			m.hoverModalBtn = hovered
-			return m, nil
-
-		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
-			for _, h := range hits {
-				if msg.Y == h.y && msg.X >= h.x0 && msg.X < h.x1 {
-					return m.triggerModalAction(h.id)
-				}
-			}
-			// Clicking outside the modal box cancels cleanly (like Esc).
-			if msg.X < boxR.x0 || msg.X >= boxR.x1 || msg.Y < boxR.y0 || msg.Y >= boxR.y1 {
-				return m.triggerModalAction("cancel")
-			}
-		}
-		return m, nil
-	}
-
-	flat := m.rows()
-	n := len(flat)
-	if n == 0 {
-		return m, nil
-	}
-
-	// Hover tracking across rows and clickable footer pills.
-	if msg.Action == tea.MouseActionMotion {
-		layout := m.computeLayout()
-		bodyH := m.bodyHeight(layout.footerHeight)
-		footerTopY := bodyH + 1
-
-		m.hoverRow = -1
-		m.hoverFooter = ""
-		if msg.Y >= 0 && msg.Y < bodyH {
-			bodyLine := msg.Y + m.offset
-			if rowIdx, ok := layout.lineToRow[bodyLine]; ok && rowIdx >= 0 && rowIdx < n {
-				m.hoverRow = rowIdx
-			}
-		} else if msg.Y >= footerTopY {
-			fy := msg.Y - footerTopY
-			for _, h := range layout.footerHits {
-				if fy == h.y && msg.X >= h.x0 && msg.X < h.x1 {
-					m.hoverFooter = h.id
-					break
-				}
-			}
-		}
-		return m, nil
-	}
-
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		if msg.Action == tea.MouseActionPress {
-			m.cur = (m.cur - 1 + n) % n
-			m.syncScroll()
-		}
-		return m, nil
-
-	case tea.MouseButtonWheelDown:
-		if msg.Action == tea.MouseActionPress {
-			m.cur = (m.cur + 1) % n
-			m.syncScroll()
-		}
-		return m, nil
-
-	case tea.MouseButtonLeft:
-		if msg.Action != tea.MouseActionPress {
-			return m, nil
-		}
-		layout := m.computeLayout()
-		bodyH := m.bodyHeight(layout.footerHeight)
-		footerTopY := bodyH + 1
-
-		// Click on a footer action button.
-		if msg.Y >= footerTopY {
-			fy := msg.Y - footerTopY
-			for _, h := range layout.footerHits {
-				if fy == h.y && msg.X >= h.x0 && msg.X < h.x1 {
-					return m.handleMainKey(keyFromAction(h.id))
-				}
-			}
-			return m, nil
-		}
-
-		if msg.Y < 0 || msg.Y >= bodyH {
-			return m, nil
-		}
-		bodyLine := msg.Y + m.offset
-		rowIdx, ok := layout.lineToRow[bodyLine]
-		if !ok || rowIdx < 0 || rowIdx >= n {
-			return m, nil
-		}
-		now := m.now()
-		isDouble := m.lastClickRow == rowIdx && now.Sub(m.lastClickAt) < 450*time.Millisecond
-		m.cur = rowIdx
-		m.hoverRow = rowIdx
-		m.lastClickRow = rowIdx
-		m.lastClickAt = now
-		m.syncScroll()
-
-		if isDouble {
-			row := flat[rowIdx]
-			if row.account == nil {
-				return m.openAddModal(row.provider)
-			}
-			if row.account.Active {
-				m.statusMsg = fmt.Sprintf("%s: already on %s", row.provider.Title(), row.account.Email)
-				m.statusTone = toneYellow
-				return m, nil
-			}
-			m.statusMsg = "Switching..."
-			m.statusTone = toneYellow
-			return m, switchCmd(m.env, row.provider, fmt.Sprintf("%d", row.account.Number))
-		}
-	}
-	return m, nil
-}
-
-func (m Model) now() time.Time {
-	if m.env != nil && m.env.Now != nil {
-		return m.env.Now()
-	}
-	return time.Now()
-}
-
-func (m *Model) clampCursor() {
-	n := len(m.rows())
-	if n == 0 {
-		m.cur = 0
+// syncViewport rebuilds the grouped list content, updates row line mappings,
+// keeps the selected row (including expanded lines) fully visible, and counts hidden rows below.
+func (m *Model) syncViewport() {
+	if m.layout.mode == layoutTooSmall {
 		return
 	}
-	if m.cur < 0 {
-		m.cur = 0
-	}
-	if m.cur >= n {
-		m.cur = n - 1
-	}
-}
+	rows := m.rows()
+	selIdx := m.selectedIndex(rows)
 
-func (m *Model) syncScroll() {
-	layout := m.computeLayout()
-	bodyH := m.bodyHeight(layout.footerHeight)
-	if bodyH <= 0 || len(layout.lines) <= bodyH {
-		m.offset = 0
-		return
+	var lines []string
+	rowRanges := make([]lineRange, len(rows))
+	lineToRow := make(map[int]int)
+
+	rowCursor := 0
+	shown := m.shownProviders()
+
+	for groupIdx, p := range shown {
+		if groupIdx > 0 {
+			lines = append(lines, "")
+		}
+		metersOn := m.usageOn[p.Key()]
+		hasErr := m.errors[p.Key()] != ""
+		accts := m.data[p.Key()]
+
+		lines = append(lines, renderToolHeader(p, metersOn, m.layout, m.theme))
+
+		if hasErr {
+			selected := rowCursor == selIdx
+			hovered := !selected && m.hoverID != nil && *m.hoverID == idForRow(rows[rowCursor])
+			rs := m.rowStylesFor(selected, hovered)
+			start := len(lines)
+			lines = append(lines, renderErrorToolRow(rs, m.layout.contentW, m.glyphs))
+			rowRanges[rowCursor] = lineRange{start: start, end: start}
+			lineToRow[start] = rowCursor
+			rowCursor++
+			continue
+		}
+
+		if len(accts) == 0 {
+			selected := rowCursor == selIdx
+			hovered := !selected && m.hoverID != nil && *m.hoverID == idForRow(rows[rowCursor])
+			rs := m.rowStylesFor(selected, hovered)
+			start := len(lines)
+			lines = append(lines, renderEmptyToolRow(rs, m.layout.contentW, m.glyphs))
+			rowRanges[rowCursor] = lineRange{start: start, end: start}
+			lineToRow[start] = rowCursor
+			rowCursor++
+			continue
+		}
+
+		maxWins := 0
+		for _, a := range accts {
+			if a.Usage != nil && len(a.Usage.Windows) > maxWins {
+				maxWins = len(a.Usage.Windows)
+			}
+		}
+		cols := computeWideColumns(m.layout.contentW, maxWins)
+
+		for _, a := range accts {
+			selected := rowCursor == selIdx
+			hovered := !selected && m.hoverID != nil && *m.hoverID == idForRow(rows[rowCursor])
+			rs := m.rowStylesFor(selected, hovered)
+			state := rowState(a, metersOn, m.loading, m.now)
+
+			var block string
+			if m.layout.mode == layoutWide {
+				block = renderWideAccountRow(a, state, cols, rs, m.glyphs, m.noColor, m.spinner.View(), m.now)
+			} else {
+				block = renderNarrowAccountRow(a, state, selected, m.layout.contentW, rs, m.glyphs, m.noColor, m.spinner.View(), m.now)
+			}
+
+			blockLines := strings.Split(block, "\n")
+			start := len(lines)
+			for _, bl := range blockLines {
+				lineToRow[len(lines)] = rowCursor
+				lines = append(lines, bl)
+			}
+			rowRanges[rowCursor] = lineRange{start: start, end: len(lines) - 1}
+			rowCursor++
+		}
 	}
-	selLine := 0
-	if m.cur >= 0 && m.cur < len(layout.rowToLine) {
-		selLine = layout.rowToLine[m.cur]
-	}
-	off := selLine - bodyH/2
-	if off < 0 {
-		off = 0
-	}
-	maxOff := len(layout.lines) - bodyH
+
+	m.rowRanges = rowRanges
+	m.lineToRow = lineToRow
+	m.viewport.Width = m.layout.contentW
+	m.viewport.Height = m.layout.bodyH
+	m.viewport.SetContent(strings.Join(lines, "\n"))
+
+	// Ensure selected row (including all expanded lines) is fully visible.
+	maxOff := max(0, len(lines)-m.layout.bodyH)
+	off := m.viewport.YOffset
 	if off > maxOff {
 		off = maxOff
 	}
-	if off < 3 {
+	if selIdx >= 0 && selIdx < len(rowRanges) {
+		rng := rowRanges[selIdx]
+		if rng.start < off {
+			off = rng.start
+			// Include the tool header directly above when jumping to the top of a group.
+			if off > 0 {
+				if _, isRow := lineToRow[off-1]; !isRow && lines[off-1] != "" {
+					off--
+				}
+			}
+		}
+		if rng.end >= off+m.layout.bodyH {
+			off = rng.end - m.layout.bodyH + 1
+			if off > rng.start {
+				off = rng.start
+			}
+		}
+	}
+	if off < 0 {
 		off = 0
 	}
-	m.offset = off
-}
-
-func (m Model) bodyHeight(footerH int) int {
-	h := m.height - 1 - footerH
-	if h < 1 {
-		return 1
+	if off > maxOff {
+		off = maxOff
 	}
-	return h
-}
+	m.viewport.SetYOffset(off)
 
-type layoutResult struct {
-	lines        []string
-	rowToLine    []int
-	lineToRow    map[int]int
-	footerLines  []string
-	footerHits   []hitRect
-	footerHeight int
-}
-
-func (m Model) renderFooter() ([]string, []hitRect) {
-	w := m.width
-	gap := 2
-	if w < 90 {
-		gap = 1
-	}
-	var rows []string
-	var hits []hitRect
-	var cur strings.Builder
-	cur.WriteString(" ")
-	x := 1
-	rowIdx := 0
-	for _, item := range footerKeys {
-		busyRefresh := m.loading && item.actionKey == "r"
-		hovered := !busyRefresh && item.actionKey != "" && item.actionKey == m.hoverFooter
-		capStyle := m.styles.keycap
-		labStyle := m.styles.muted
-		if busyRefresh {
-			capStyle = m.styles.dim
-			labStyle = m.styles.dim
-		} else if hovered {
-			capStyle = m.styles.keycapHover
-			labStyle = m.styles.bold
+	// Count rows hidden below the viewport for the header scroll indicator.
+	bottom := off + m.layout.bodyH
+	hidden := 0
+	for _, rng := range rowRanges {
+		if rng.start >= bottom {
+			hidden++
 		}
-		capStr := capStyle.Render(item.key)
-		labStr := " " + labStyle.Render(item.label)
-		itemStr := capStr + labStr
-		need := lipgloss.Width(itemStr)
-		if x+need > w-1 && x > 1 {
-			rows = append(rows, cur.String())
-			cur.Reset()
-			cur.WriteString(" ")
-			x = 1
-			rowIdx++
-		}
-		if x > 1 {
-			cur.WriteString(strings.Repeat(" ", gap))
-			x += gap
-		}
-		if item.actionKey != "" {
-			hits = append(hits, hitRect{
-				id: item.actionKey,
-				x0: x,
-				x1: x + need,
-				y:  rowIdx,
-			})
-		}
-		cur.WriteString(itemStr)
-		x += need
 	}
-	if cur.Len() > 1 {
-		rows = append(rows, cur.String())
+	if hidden == 0 && bottom < len(lines) {
+		hidden = 1
 	}
-	if len(rows) == 0 {
-		rows = []string{""}
-	}
-	return rows, hits
+	m.hiddenBelow = hidden
+
+	// Rebuild footer hits to match current layout mode.
+	_, m.footerHits = m.renderFooter()
 }
 
-func smoothMeter(pct float64, width int) (string, string) {
-	total := width * 8
-	units := int(math.Round(float64(total) * pct / 100.0))
-	if units < 0 {
-		units = 0
+func (m Model) rowStylesFor(selected, hovered bool) rowStyles {
+	if selected {
+		return m.theme.rowSelected
 	}
-	if units > total {
-		units = total
+	if hovered {
+		return m.theme.rowHover
 	}
-	full := units / 8
-	rem := units % 8
-	var fill strings.Builder
-	for i := 0; i < full; i++ {
-		fill.WriteRune('█')
-	}
-	fillRunes := full
-	if rem > 0 && full < width {
-		fill.WriteRune(eighths[rem])
-		fillRunes++
-	}
-	track := strings.Repeat("░", max(0, width-fillRunes))
-	return fill.String(), track
+	return m.theme.rowNormal
 }
 
-func (m Model) levelStyle(pct float64, stale bool) lipgloss.Style {
-	var s lipgloss.Style
+func (m Model) renderHeader() string {
+	left := " " + m.theme.brand.Render("tori")
+
+	var right string
 	switch {
-	case pct < 60:
-		s = m.styles.green
-	case pct < 85:
-		s = m.styles.yellow
-	default:
-		s = m.styles.red
+	case m.headerMsg.kind == msgSuccess:
+		right = m.theme.good.Render(m.glyphs.done + " " + m.headerMsg.text)
+	case m.headerMsg.kind == msgError:
+		right = m.theme.bad.Render(m.glyphs.bad + " " + m.headerMsg.text)
+	case m.headerMsg.kind == msgWarning:
+		right = m.theme.warn.Render(m.glyphs.warn + " " + m.headerMsg.text)
+	case m.headerMsg.kind == msgInfo:
+		right = m.theme.dim.Render(m.headerMsg.text)
+	case m.hasOfflineRows():
+		right = m.theme.warn.Render(fmt.Sprintf("%s offline %s showing last readings", m.glyphs.warn, m.glyphs.sep))
+	case m.hiddenBelow > 0:
+		right = m.theme.dim.Render(fmt.Sprintf("%s %d more", m.glyphs.down, m.hiddenBelow))
 	}
-	if stale {
-		s = s.Faint(true)
+
+	if right == "" {
+		return left
 	}
-	return s
+	maxRight := max(0, m.layout.contentW-1-lipgloss.Width(left)-2)
+	if maxRight == 0 {
+		return left
+	}
+	if lipgloss.Width(right) > maxRight {
+		right = fitCell(right, maxRight, false)
+	}
+	gap := m.layout.contentW - 1 - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 2 {
+		gap = 2
+	}
+	return left + strings.Repeat(" ", gap) + right + " "
 }
 
-func (m Model) renderUsageSegments(u *provider.UsageInfo, bw int, withReset bool, labW int) string {
-	if u == nil {
-		return ""
+func (m Model) renderFooter() (string, []footerHit) {
+	hints := wideFooterHints(m.glyphs)
+	if m.layout.mode == layoutNarrow {
+		hints = narrowFooterHints(m.glyphs)
 	}
-	stale := (u.Error != nil && *u.Error != "") || (u.AgeSeconds != nil && *u.AgeSeconds > 300)
 	var parts []string
-	now := m.now()
-
-	for _, w := range u.Windows {
-		fill, track := smoothMeter(w.Pct, bw)
-		lab := fmt.Sprintf("%-*s ", labW, w.Label)
-		pctText := fmt.Sprintf(" %3.0f%%", w.Pct)
-		pctStyle := m.styles.text
-		if stale {
-			pctStyle = m.styles.dim
+	var hits []footerHit
+	x := 1
+	for i, h := range hints {
+		if i > 0 {
+			parts = append(parts, "  ")
+			x += 2
 		}
-		seg := m.styles.muted.Render(lab) +
-			m.levelStyle(w.Pct, stale).Render(fill) +
-			m.styles.track.Render(track) +
-			pctStyle.Render(pctText)
-		if withReset {
-			if ep, ok := provider.ResetEpoch(w.ResetsAt); ok {
-				cd := " ↻" + provider.FmtCountdown(ep, now)
-				seg += m.styles.muted.Render(fmt.Sprintf("%-8s", cd))
-			} else {
-				seg += strings.Repeat(" ", 8)
-			}
-		}
-		parts = append(parts, seg)
-	}
-	if u.Error != nil && *u.Error != "" {
-		errText := *u.Error
-		displayErr := errText
-		if u.RetryAfterSeconds != nil && *u.RetryAfterSeconds > 0 {
-			displayErr += " · retry " + provider.FmtWait(*u.RetryAfterSeconds)
-		}
-		if strings.Contains(errText, "expired") || strings.Contains(errText, "offline") {
-			parts = append(parts, m.styles.red.Render(displayErr))
-		} else {
-			parts = append(parts, m.styles.muted.Render(displayErr))
-		}
-	} else if stale && u.AgeSeconds != nil {
-		parts = append(parts, m.styles.muted.Render(provider.FmtAge(*u.AgeSeconds)))
-	}
-	return strings.Join(parts, "  ")
-}
-
-func truncateRunes(s string, maxW int) string {
-	if maxW <= 0 {
-		return ""
-	}
-	if runewidth.StringWidth(s) <= maxW {
-		return s
-	}
-	if maxW == 1 {
-		return "…"
-	}
-	var b strings.Builder
-	w := 0
-	for _, r := range s {
-		rw := runewidth.RuneWidth(r)
-		if w+rw > maxW-1 {
+		item := m.theme.key.Render(h.keyLabel) + " " + m.theme.dim.Render(h.desc)
+		w := lipgloss.Width(item)
+		if x+w > m.layout.contentW {
 			break
 		}
-		b.WriteRune(r)
-		w += rw
+		parts = append(parts, item)
+		if h.action != "" {
+			hits = append(hits, footerHit{action: h.action, x0: x, x1: x + w})
+		}
+		x += w
 	}
-	b.WriteRune('…')
-	return b.String()
+	return " " + strings.Join(parts, ""), hits
 }
 
-func padRightWidth(s string, target int) string {
-	w := runewidth.StringWidth(s)
-	if w >= target {
-		return s
-	}
-	return s + strings.Repeat(" ", target-w)
-}
-
-func (m Model) computeLayout() layoutResult {
-	footerLines, footerHits := m.renderFooter()
-	w := m.width
-	cw := max(30, min(w-2, 112))
-	inner := cw - 2
-
-	flat := m.rows()
-	var realAccts []provider.AccountEntry
-	for _, r := range flat {
-		if r.account != nil {
-			realAccts = append(realAccts, *r.account)
-		}
-	}
-
-	nameW := 8
-	aliasW := 0
-	planW := 0
-	labW := 2
-	for _, a := range realAccts {
-		if ew := runewidth.StringWidth(a.Email); ew > nameW {
-			nameW = ew
-		}
-		if a.Alias != nil && *a.Alias != "" {
-			if aw := runewidth.StringWidth(*a.Alias) + 2; aw > aliasW {
-				aliasW = aw
-			}
-		}
-		if a.Plan != nil && a.Plan.Label != "" {
-			if pw := runewidth.StringWidth(a.Plan.Label) + 2; pw > planW {
-				planW = pw
-			}
-		}
-		if a.Usage != nil {
-			for _, win := range a.Usage.Windows {
-				if lw := runewidth.StringWidth(win.Label); lw > labW {
-					labW = lw
-				}
-			}
-		}
-	}
-	if nameW > 30 {
-		nameW = 30
-	}
-	leftW := 9 + nameW
-	if aliasW > 0 {
-		leftW += 2 + aliasW
-	}
-	if planW > 0 {
-		leftW += 2 + planW
-	}
-
-	var lines []string
-	rowToLine := make([]int, len(flat))
-	lineToRow := make(map[int]int)
-
-	// Header line
-	nAcc := len(realAccts)
-	accWord := "accounts"
-	if nAcc == 1 {
-		accWord = "account"
-	}
-	leftHead := " " + m.styles.accent.Bold(true).Render("◆ ") +
-		m.styles.bold.Render("Tori") +
-		m.styles.muted.Render("  AI account switcher")
-	if m.loading {
-		leftHead += "  " + m.spinner.View()
-	}
-	summary := m.styles.muted.Render(fmt.Sprintf("%d tools · %d %s", len(m.providers), nAcc, accWord))
-	gapW := cw - lipgloss.Width(leftHead) - lipgloss.Width(summary) + 1
-	if gapW >= 2 {
-		lines = append(lines, leftHead+strings.Repeat(" ", gapW)+summary)
-	} else {
-		lines = append(lines, leftHead)
-	}
-	lines = append(lines, "")
-
-	boxed := func(content string) string {
-		visW := lipgloss.Width(content)
-		pad := inner - visW
-		if pad < 0 {
-			pad = 0
-		}
-		return " " + m.styles.border.Render("│") + content + strings.Repeat(" ", pad) + m.styles.border.Render("│")
-	}
-
-	idx := 0
-	for _, p := range m.shownProviders() {
-		accts := m.data[p.Key()]
-		errText := m.errors[p.Key()]
-
-		count := ""
-		if len(accts) > 0 {
-			count = fmt.Sprintf(" · %d", len(accts))
-		}
-		tag := " · usage off"
-		if m.usageOn[p.Key()] {
-			tag = " · usage on"
-		}
-		b := m.styles.brand(p.Key())
-		titlePart := " " + b.iconStyle.Render(b.icon+" "+p.Title()) +
-			m.styles.muted.Render(count) +
-			m.styles.dim.Render(tag+" ")
-		titleW := lipgloss.Width(titlePart)
-		dashW := max(0, inner-1-titleW)
-		top := " " + m.styles.border.Render("╭─") + titlePart + m.styles.border.Render(strings.Repeat("─", dashW)+"╮")
-		lines = append(lines, top)
-
-		if errText != "" || len(accts) == 0 {
-			sel := idx == m.cur
-			hov := idx == m.hoverRow && !sel
-			rowToLine[idx] = len(lines)
-			lineToRow[len(lines)] = idx
-			mark := " "
-			if sel {
-				mark = m.styles.accent.Bold(true).Render("▌")
-			} else if hov {
-				mark = m.styles.accent.Render("›")
-			}
-			var msg string
-			if errText != "" {
-				msg = m.styles.red.Render(truncateRunes("error: "+errText, max(10, inner-4)))
-			} else {
-				st := m.styles.muted
-				if sel || hov {
-					st = m.styles.text
-				}
-				msg = st.Render(truncateRunes("no accounts yet — press a or click to add", max(10, inner-4)))
-			}
-			lines = append(lines, boxed(" "+mark+" "+msg))
-			idx++
-		} else {
-			for _, a := range accts {
-				sel := idx == m.cur
-				hov := idx == m.hoverRow && !sel
-				rowToLine[idx] = len(lines)
-				lineToRow[len(lines)] = idx
-
-				mark := " "
-				if sel {
-					mark = m.styles.accent.Bold(true).Render("▌")
-				} else if hov {
-					mark = m.styles.accent.Render("›")
-				}
-				dot := m.styles.track.Render("○")
-				if a.Active {
-					dot = m.styles.green.Render("●")
-				}
-				nameStyle := m.styles.muted
-				if a.Active || sel || hov {
-					nameStyle = m.styles.text
-					if sel {
-						nameStyle = m.styles.bold
-					}
-				}
-				numStr := nameStyle.Render(fmt.Sprintf("%2d", a.Number))
-				emailStr := nameStyle.Render(padRightWidth(truncateRunes(a.Email, nameW), nameW))
-
-				var segs strings.Builder
-				segs.WriteString(" ")
-				segs.WriteString(mark)
-				segs.WriteString(" ")
-				segs.WriteString(dot)
-				segs.WriteString(" ")
-				segs.WriteString(numStr)
-				segs.WriteString("  ")
-				segs.WriteString(emailStr)
-
-				if aliasW > 0 {
-					segs.WriteString("  ")
-					aliasTxt := ""
-					if a.Alias != nil && *a.Alias != "" {
-						aliasTxt = "[" + *a.Alias + "]"
-					}
-					segs.WriteString(m.styles.muted.Render(padRightWidth(aliasTxt, aliasW)))
-				}
-				if planW > 0 {
-					segs.WriteString("  ")
-					if a.Plan != nil && a.Plan.Label != "" {
-						badge := m.styles.badge.Render(a.Plan.Label)
-						bw := lipgloss.Width(badge)
-						segs.WriteString(badge)
-						if bw < planW {
-							segs.WriteString(strings.Repeat(" ", planW-bw))
-						}
-					} else {
-						segs.WriteString(strings.Repeat(" ", planW))
-					}
-				}
-
-				var extraLine string
-				if a.Note != "" {
-					noteRendered := m.styles.muted.Render(a.Note)
-					avail := inner - 1 - leftW - 3
-					if lipgloss.Width(noteRendered) <= avail {
-						segs.WriteString("   ")
-						segs.WriteString(noteRendered)
-					} else {
-						extraLine = noteRendered
-					}
-				} else if a.Usage != nil {
-					avail := inner - 1 - leftW - 3
-					placed := false
-					for _, cfg := range []struct {
-						bw    int
-						reset bool
-					}{
-						{10, true}, {8, true}, {6, true},
-						{10, false}, {8, false}, {6, false}, {4, false},
-					} {
-						us := m.renderUsageSegments(a.Usage, cfg.bw, cfg.reset, labW)
-						if lipgloss.Width(us) <= avail {
-							segs.WriteString("   ")
-							segs.WriteString(us)
-							placed = true
-							break
-						}
-					}
-					if !placed {
-						extraLine = m.renderUsageSegments(a.Usage, 8, true, labW)
-					}
-				}
-
-				lines = append(lines, boxed(segs.String()))
-				if extraLine != "" {
-					lineToRow[len(lines)] = idx
-					lines = append(lines, boxed(" "+mark+strings.Repeat(" ", 7)+extraLine))
-				}
-				idx++
-			}
-		}
-		bot := " " + m.styles.border.Render("╰"+strings.Repeat("─", inner)+"╯")
-		lines = append(lines, bot)
-		lines = append(lines, "")
-	}
-
-	return layoutResult{
-		lines:        lines,
-		rowToLine:    rowToLine,
-		lineToRow:    lineToRow,
-		footerLines:  footerLines,
-		footerHits:   footerHits,
-		footerHeight: len(footerLines),
-	}
-}
-
-type modalBtnSpec struct {
-	id    string
-	label string
-	kind  string // "ok", "del", "no"
-}
-
-func (m Model) renderBtn(b modalBtnSpec) string {
-	hov := b.id == m.hoverModalBtn
-	switch b.kind {
-	case "ok":
-		if hov {
-			return m.styles.btnOkHover.Render(b.label)
-		}
-		return m.styles.btnOk.Render(b.label)
-	case "del":
-		if hov {
-			return m.styles.btnDelHover.Render(b.label)
-		}
-		return m.styles.btnDel.Render(b.label)
-	default:
-		if hov {
-			return m.styles.btnNoHover.Render(b.label)
-		}
-		return m.styles.btnNo.Render(b.label)
-	}
-}
-
-func (m Model) buildModal() (string, []hitRect, boxRect) {
-	bw := max(32, min(m.width-4, 72))
-	wrap := func(w int, s string) string {
-		if w < 20 {
-			w = 20
-		}
-		return lipgloss.NewStyle().Width(w).Render(s)
-	}
-
-	type relHit struct {
-		id     string
-		x0, x1 int
-		line   int
-	}
-	var extraRelHits []relHit
-	var parts []string
-	var btnSpecs []modalBtnSpec
-	boxW := min(bw, 66)
-
-	switch m.modal {
-	case modalAdd:
-		p := m.modalProvider
-		bodyW := boxW - 6
-
-		// Build interactive provider tab strip (←/→ or click to switch tool).
-		var tabStrs []string
-		tx := 0
-		for i, prov := range m.providers {
-			b := m.styles.brand(prov.Key())
-			tabID := "tab:" + prov.Key()
-			label := b.icon + " " + prov.Title()
-			var rendered string
-			if prov.Key() == p.Key() {
-				rendered = b.tabActive.Render(label)
-			} else if m.hoverModalBtn == tabID {
-				rendered = b.tabHover.Render(label)
-			} else {
-				rendered = b.tabIdle.Render(label)
-			}
-			tw := lipgloss.Width(rendered)
-			if i > 0 {
-				tx += 2
-			}
-			// Line 0 is title, line 1 is blank, line 2 is tab strip.
-			extraRelHits = append(extraRelHits, relHit{id: tabID, x0: tx, x1: tx + tw, line: 2})
-			tx += tw
-			tabStrs = append(tabStrs, rendered)
-		}
-		title := m.styles.bold.Render("Add account") + "   " + m.styles.muted.Render("←/→ or click tool")
-		tabBar := strings.Join(tabStrs, "  ")
-
-		if m.addStep == addStepSave {
-			var statusLine string
-			if m.addStatus.ManagedSlot != nil {
-				statusLine = m.styles.yellow.Render(fmt.Sprintf("● Updating slot %d: %s", *m.addStatus.ManagedSlot, m.addStatus.DisplayName))
-			} else if p.Key() == "antigravity" {
-				statusLine = m.styles.green.Render("● Live Antigravity login detected")
-			} else {
-				statusLine = m.styles.green.Render(fmt.Sprintf("● Ready to save: %s", m.addStatus.DisplayName))
-			}
-			parts = []string{title, "", tabBar, "", statusLine}
-			if p.Key() == "antigravity" {
-				parts = append(parts, m.styles.muted.Render(wrap(bodyW, "Give it an optional alias (Google email loads automatically when usage meters are on).")))
-			}
-			parts = append(parts, "", m.aliasInput.View(), "")
-			btnSpecs = []modalBtnSpec{
-				{id: "save", label: "Enter: Save", kind: "ok"},
-				{id: "cancel", label: "Esc: Cancel", kind: "no"},
-			}
-		} else {
-			parts = []string{title, "", tabBar, ""}
-			if m.addStatus.ManagedSlot != nil {
-				parts = append(parts, m.styles.green.Render(wrap(bodyW, fmt.Sprintf("● Already saved: %s (slot %d)", m.addStatus.DisplayName, *m.addStatus.ManagedSlot))))
-			} else {
-				parts = append(parts, m.styles.muted.Render("○ Not currently signed in."))
-			}
-			parts = append(parts, "")
-
-			var step1 string
-			switch p.Key() {
-			case "claude":
-				if m.addStatus.ManagedSlot != nil {
-					step1 = "1. Log out and sign in to another account in Claude Code."
-				} else {
-					step1 = "1. Sign in to Claude Code (`claude` → /login)."
-				}
-			case "codex":
-				if m.addStatus.ManagedSlot != nil {
-					step1 = "1. Log out and sign in to another account in Codex (`codex login`)."
-				} else {
-					step1 = "1. Sign in to Codex (`codex login`)."
-				}
-			default:
-				if m.addStatus.ManagedSlot != nil {
-					step1 = "1. Log out and sign in to another account in T3 Code (Antigravity)."
-				} else {
-					step1 = "1. Sign in to Antigravity in T3 Code."
-				}
-			}
-			parts = append(parts,
-				m.styles.text.Render(wrap(bodyW, step1)),
-				m.styles.text.Render(wrap(bodyW, "2. Press r (or click Re-check) — Tori will add it if it isn't already saved.")),
-			)
-
-			if m.addNotice != "" {
-				noticeStyle := m.styles.yellow
-				if m.addNoticeErr {
-					noticeStyle = m.styles.red
-				}
-				parts = append(parts, "", noticeStyle.Render(wrap(bodyW, m.addNotice)))
-			}
-
-			btnSpecs = append(btnSpecs, modalBtnSpec{id: "recheck", label: "r / Enter: Re-check", kind: "ok"})
-			if m.addStatus.ManagedSlot != nil {
-				btnSpecs = append(btnSpecs, modalBtnSpec{id: "update", label: fmt.Sprintf("s: Update slot %d", *m.addStatus.ManagedSlot), kind: "no"})
-			}
-			btnSpecs = append(btnSpecs, modalBtnSpec{id: "cancel", label: "Esc: Cancel", kind: "no"})
-			parts = append(parts, "")
-		}
-
-	case modalDelete:
-		bodyW := boxW - 6
-		b := m.styles.brand(m.modalProvider.Key())
-		title := m.styles.red.Bold(true).Render(fmt.Sprintf("Remove %s %s slot %d?", b.icon, m.modalProvider.Title(), m.modalAccount.Number))
-		who := m.styles.bold.Render(m.modalAccount.Email)
-		if m.modalAccount.Alias != nil && *m.modalAccount.Alias != "" {
-			who += " " + m.styles.muted.Render("["+*m.modalAccount.Alias+"]")
-		}
-		if m.modalAccount.Active {
-			who += "  " + m.styles.yellow.Render("● active")
-		}
-
-		parts = []string{title, "", who, ""}
-		if m.modalAccount.Active {
-			other := m.nextOtherAccount(m.modalProvider.Key(), m.modalAccount.Number)
-			if other != nil {
-				parts = append(parts, m.styles.text.Render(wrap(bodyW, "This account is currently active. Removing only forgets Tori's saved copy — your live login stays signed in unless you switch.")))
-				parts = append(parts, m.styles.muted.Render(wrap(bodyW, fmt.Sprintf("Tip: press s to switch to %s and remove this slot in one step.", other.Email))))
-				btnSpecs = append(btnSpecs,
-					modalBtnSpec{id: "switch_remove", label: "s: Switch & remove", kind: "ok"},
-					modalBtnSpec{id: "remove", label: "y: Remove only", kind: "del"},
-				)
-			} else {
-				parts = append(parts, m.styles.text.Render(wrap(bodyW, "This is your active login. Removing only forgets Tori's saved copy — your account is not deleted.")))
-				parts = append(parts, m.styles.muted.Render(wrap(bodyW, "Press c to also clear the local login file on this machine.")))
-				btnSpecs = append(btnSpecs,
-					modalBtnSpec{id: "remove", label: "y: Remove only", kind: "del"},
-					modalBtnSpec{id: "remove_clear", label: "c: Remove & clear login", kind: "no"},
-				)
-			}
-		} else {
-			parts = append(parts, m.styles.muted.Render(wrap(bodyW, "Only forgets Tori's saved copy — your account and current login are untouched. Remaining slots are renumbered.")))
-			btnSpecs = append(btnSpecs, modalBtnSpec{id: "remove", label: "y: Remove", kind: "del"})
-		}
-		btnSpecs = append(btnSpecs, modalBtnSpec{id: "cancel", label: "n / Esc: Cancel", kind: "no"})
-		parts = append(parts, "")
-
-	case modalDisclaimer:
-		boxW = min(bw, 64)
-		bodyW := boxW - 6
-		p := m.modalProvider
-		b := m.styles.brand(p.Key())
-		title := m.styles.bold.Render("Turn on usage meters for ") + b.iconStyle.Render(b.icon+" "+p.Title()) + m.styles.bold.Render("?")
-		parts = []string{
-			title,
-			"",
-			m.styles.text.Render(wrap(bodyW, config.DisclaimerHead)),
-		}
-		warnText, hasWarn := config.DisclaimerTool[p.Key()]
-		if hasWarn {
-			parts = append(parts, "", m.styles.yellow.Bold(true).Render(wrap(bodyW, "⚠ "+warnText)))
-		}
-		parts = append(parts, "", m.styles.muted.Render(wrap(bodyW, config.DisclaimerTail)), "")
-
-		okLabel := "y / Enter: Turn On"
-		if hasWarn {
-			okLabel = "y / Enter: Accept & Turn On"
-		}
-		btnSpecs = []modalBtnSpec{
-			{id: "accept", label: okLabel, kind: "ok"},
-			{id: "cancel", label: "n / Esc: Cancel", kind: "no"},
-		}
-	default:
-		return "", nil, boxRect{}
-	}
-
-	// Render buttons across 1 or 2 rows and record their relative hit coordinates.
-	bodyW := boxW - 6
-	renderedBtns := make([]string, len(btnSpecs))
-	widths := make([]int, len(btnSpecs))
-	totalW := 0
-	for i, b := range btnSpecs {
-		renderedBtns[i] = m.renderBtn(b)
-		widths[i] = lipgloss.Width(renderedBtns[i])
-		if i > 0 {
-			totalW += 2
-		}
-		totalW += widths[i]
-	}
-
-	preContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
-	btnStartLine := len(strings.Split(preContent, "\n"))
-
-	relHits := append([]relHit{}, extraRelHits...)
-	var btnRows string
-	if totalW > bodyW && len(btnSpecs) >= 3 {
-		x := 0
-		for i := 0; i < 2; i++ {
-			if i > 0 {
-				x += 2
-			}
-			relHits = append(relHits, relHit{id: btnSpecs[i].id, x0: x, x1: x + widths[i], line: btnStartLine})
-			x += widths[i]
-		}
-		x = 0
-		for i := 2; i < len(btnSpecs); i++ {
-			if i > 2 {
-				x += 2
-			}
-			relHits = append(relHits, relHit{id: btnSpecs[i].id, x0: x, x1: x + widths[i], line: btnStartLine + 2})
-			x += widths[i]
-		}
-		btnRows = strings.Join(renderedBtns[:2], "  ") + "\n\n" + strings.Join(renderedBtns[2:], "  ")
-	} else {
-		x := 0
-		for i := range btnSpecs {
-			if i > 0 {
-				x += 2
-			}
-			relHits = append(relHits, relHit{id: btnSpecs[i].id, x0: x, x1: x + widths[i], line: btnStartLine})
-			x += widths[i]
-		}
-		btnRows = strings.Join(renderedBtns, "  ")
-	}
-
-	fullContent := preContent + "\n" + btnRows
-	box := m.styles.modal.Width(boxW).Render(fullContent)
-
-	renderedW := lipgloss.Width(box)
-	renderedH := lipgloss.Height(box)
-	placeH := max(1, m.height-2)
-	leftX := max(0, (m.width-renderedW)/2)
-	topY := 1 + max(0, (placeH-renderedH)/2) // 1 for the top header line
-
-	// Modal box has 1-cell border + 1-line top padding + 2-col left padding.
-	innerX := leftX + 3
-	innerY := topY + 2
-	hits := make([]hitRect, 0, len(relHits))
-	for _, rh := range relHits {
-		hits = append(hits, hitRect{
-			id: rh.id,
-			x0: innerX + rh.x0,
-			x1: innerX + rh.x1,
-			y:  innerY + rh.line,
-		})
-	}
-	boxR := boxRect{
-		x0: leftX,
-		y0: topY,
-		x1: leftX + renderedW,
-		y1: topY + renderedH,
-	}
-	return box, hits, boxR
-}
-
-// View renders the TUI screen.
+// View renders the entire TUI screen purely from model state (never calls time.Now()).
 func (m Model) View() string {
-	if m.width < 30 || m.height < 6 {
-		return m.styles.red.Render("terminal too small")
+	if m.layout.mode == layoutTooSmall {
+		msg := lipgloss.JoinVertical(lipgloss.Center,
+			m.theme.text.Render("Terminal too small"),
+			m.theme.dim.Render(fmt.Sprintf("need 42 %s 8", m.glyphs.times)),
+		)
+		return lipgloss.Place(max(1, m.layout.termW), max(1, m.layout.termH), lipgloss.Center, lipgloss.Center, msg)
 	}
 
-	if m.modal != modalNone {
-		header := " " + m.styles.accent.Bold(true).Render("◆ ") +
-			m.styles.bold.Render("Tori") +
-			m.styles.muted.Render("  AI account switcher")
-		modalBox, _, _ := m.buildModal()
-		placed := lipgloss.Place(m.width, max(1, m.height-2), lipgloss.Center, lipgloss.Center, modalBox)
-		return header + "\n" + placed
+	header := m.renderHeader()
+
+	if m.dlg.kind != dialogNone {
+		box, _, _ := m.buildDialog()
+		placed := lipgloss.Place(m.layout.termW, max(1, m.layout.termH-2), lipgloss.Center, lipgloss.Center, box)
+		return header + "\n\n" + placed
 	}
 
-	layout := m.computeLayout()
-	bodyH := m.bodyHeight(layout.footerHeight)
-
-	offset := m.offset
-	if offset > max(0, len(layout.lines)-bodyH) {
-		offset = max(0, len(layout.lines)-bodyH)
-	}
-	end := min(len(layout.lines), offset+bodyH)
-
-	var out []string
-	out = append(out, layout.lines[offset:end]...)
-	for len(out) < bodyH {
-		out = append(out, "")
-	}
-
-	// Status / scroll indicator line
-	more := ""
-	if offset > 0 {
-		more += "▴"
-	}
-	if end < len(layout.lines) {
-		more += "▾"
-	}
-	statusText := ""
-	if m.statusMsg != "" {
-		var st lipgloss.Style
-		switch m.statusTone {
-		case toneGreen:
-			st = m.styles.green
-		case toneYellow:
-			st = m.styles.yellow
-		case toneRed:
-			st = m.styles.red
-		default:
-			st = m.styles.text
-		}
-		prefix := "  "
-		if m.loading {
-			prefix = "  " + m.spinner.View() + " "
-		}
-		avail := max(10, m.width-6)
-		statusText = prefix + st.Render(truncateRunes(m.statusMsg, avail))
-	}
-	if more != "" {
-		pad := max(1, m.width-lipgloss.Width(statusText)-len([]rune(more))-2)
-		statusText += strings.Repeat(" ", pad) + m.styles.muted.Render(more)
-	}
-	out = append(out, statusText)
-	out = append(out, layout.footerLines...)
-	return strings.Join(out, "\n")
+	footer, _ := m.renderFooter()
+	return header + "\n\n" + m.viewport.View() + "\n" + footer
 }
 
 // Run starts the interactive Bubble Tea TUI.

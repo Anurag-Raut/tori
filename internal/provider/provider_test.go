@@ -72,6 +72,9 @@ func TestNoNetworkWhenUsageOff(t *testing.T) {
 	})
 
 	env, envMap := newTestEnv(t, forbidNet)
+	if err := config.SetUsage(env.Root, config.ToolKeys, false); err != nil {
+		t.Fatal(err)
+	}
 
 	// Setup live credentials for Claude, Codex, and Antigravity.
 	claudeCreds := filepath.Join(env.Home, ".claude", ".credentials.json")

@@ -73,6 +73,7 @@ type Env struct {
 	GOARCH         string
 	ForceUsageOff  bool
 	DisableNetwork bool
+	ASCII          bool
 	Warn           func(string)
 	Environ        func(string) string
 }
@@ -93,6 +94,11 @@ func NewEnv() *Env {
 		},
 		Environ: os.Getenv,
 	}
+}
+
+// Getenv reads an environment variable using Env.Environ if set, else os.Getenv.
+func (e *Env) Getenv(k string) string {
+	return e.getenv(k)
 }
 
 func (e *Env) getenv(k string) string {
@@ -185,6 +191,7 @@ type JSONList struct {
 type StatusInfo struct {
 	LoggedIn    bool
 	DisplayName string // email or "API key" or "(unknown email)"
+	Plan        string // optional plan label (e.g. "Pro", "Plus", "API")
 	ManagedSlot *int   // nil if not saved in tori
 	Message     string // custom status line (e.g. Antigravity)
 }

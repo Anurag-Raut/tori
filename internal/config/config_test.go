@@ -11,12 +11,12 @@ func TestUsageDefaultsAndSetUsage(t *testing.T) {
 	root := t.TempDir()
 
 	for _, k := range ToolKeys {
-		if UsageEnabled(root, k) {
-			t.Fatalf("expected usage off by default for %s", k)
+		if !UsageEnabled(root, k) {
+			t.Fatalf("expected usage on by default for %s", k)
 		}
 	}
 
-	if err := SetUsage(root, []string{"claude"}, true); err != nil {
+	if err := SetUsage(root, []string{"claude"}, false); err != nil {
 		t.Fatalf("SetUsage failed: %v", err)
 	}
 	info, err := os.Stat(Path(root))
@@ -27,18 +27,18 @@ func TestUsageDefaultsAndSetUsage(t *testing.T) {
 		t.Fatalf("expected config.json mode 0600, got %o", info.Mode().Perm())
 	}
 
-	if !UsageEnabled(root, "claude") {
-		t.Fatal("expected claude usage enabled")
+	if UsageEnabled(root, "claude") {
+		t.Fatal("expected claude usage disabled")
 	}
-	if UsageEnabled(root, "codex") || UsageEnabled(root, "antigravity") {
-		t.Fatal("expected codex and antigravity usage still off")
+	if !UsageEnabled(root, "codex") || !UsageEnabled(root, "antigravity") {
+		t.Fatal("expected codex and antigravity usage still on")
 	}
 
-	if err := SetUsage(root, []string{"claude", "codex"}, false); err != nil {
+	if err := SetUsage(root, []string{"claude"}, true); err != nil {
 		t.Fatal(err)
 	}
-	if UsageEnabled(root, "claude") {
-		t.Fatal("expected claude usage off after toggle")
+	if !UsageEnabled(root, "claude") {
+		t.Fatal("expected claude usage on after re-enabling")
 	}
 }
 

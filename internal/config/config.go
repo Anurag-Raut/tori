@@ -73,7 +73,8 @@ func Path(root string) string {
 	return filepath.Join(root, "config.json")
 }
 
-// Load reads config.json from root. Missing or corrupt config defaults to all usage meters off.
+// Load reads config.json from root. Missing or corrupt config leaves Usage empty
+// so UsageEnabled falls back to the default (on).
 func Load(root string) Config {
 	var cfg Config
 	if !store.ReadJSON(Path(root), &cfg) {
@@ -85,13 +86,16 @@ func Load(root string) Config {
 	return cfg
 }
 
-// UsageEnabled returns true only when config.json explicitly sets usage.<key> = true.
+// UsageEnabled returns true by default unless config.json explicitly sets usage.<key> = false.
 func UsageEnabled(root, key string) bool {
 	cfg := Load(root)
-	return cfg.Usage[key]
+	if enabled, ok := cfg.Usage[key]; ok {
+		return enabled
+	}
+	return true
 }
 
-// SetUsage updates usage opt-in flags for the given keys and saves config.json atomically (0600).
+// SetUsage updates usage meter flags for the given keys and saves config.json atomically (0600).
 func SetUsage(root string, keys []string, enabled bool) error {
 	raw := store.ReadJSONMap(Path(root))
 	if raw == nil {
@@ -103,7 +107,7 @@ func SetUsage(root string, keys []string, enabled bool) error {
 	}
 	for _, k := range ToolKeys {
 		if _, exists := u[k]; !exists {
-			u[k] = false
+			u[k] = true
 		}
 	}
 	for _, k := range keys {
