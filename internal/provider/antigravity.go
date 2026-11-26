@@ -261,9 +261,13 @@ func (g *Antigravity) cliTokenPaths(env *Env) (cliFile, desktop2File string, ins
 		}
 	}
 	if !installed && env.Home != "" {
+		binName := "agy"
+		if env.GOOS == "windows" {
+			binName = "agy.exe"
+		}
 		for _, p := range []string{
-			filepath.Join(env.Home, ".local", "bin", "agy"),
-			filepath.Join(env.Home, ".gemini", "antigravity-cli", "bin", "agy"),
+			filepath.Join(env.Home, ".local", "bin", binName),
+			filepath.Join(env.Home, ".gemini", "antigravity-cli", "bin", binName),
 		} {
 			if fileExists(p) {
 				installed = true

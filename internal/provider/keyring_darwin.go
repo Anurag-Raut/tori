@@ -37,11 +37,16 @@ func (osKeyring) Get(service, user string) (string, error) {
 
 func (osKeyring) Set(service, user, secret string) error {
 	cmdLine := buildSecurityAddCommand(service, user, secret)
-	if len(cmdLine) <= darwinSecurityInteractiveMaxLen {
+	if !strings.ContainsAny(service+user, "\r\n") && len(cmdLine) <= darwinSecurityInteractiveMaxLen {
 		cmd := exec.Command(darwinSecurityBin, "-i")
 		cmd.Stdin = strings.NewReader(cmdLine)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("keychain write failed: %w (%s)", err, strings.TrimSpace(string(out)))
+		out, err := cmd.CombinedOutput()
+		msg := strings.TrimSpace(string(out))
+		if err != nil {
+			return fmt.Errorf("keychain write failed: %w (%s)", err, msg)
+		}
+		if strings.Contains(strings.ToLower(msg), "security:") {
+			return fmt.Errorf("keychain write failed: %s", msg)
 		}
 		return nil
 	}

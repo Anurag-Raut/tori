@@ -280,9 +280,83 @@ func isAntigravityProcessRunning(surface string) bool {
 			}
 		}
 		return false
+	case "windows":
+		return isAntigravityProcessRunningWindows(selfPID, surface)
 	default:
 		return false
 	}
+}
+
+func isAntigravityProcessRunningWindows(selfPID int, surface string) bool {
+	// Fast path via tasklist (~40ms) avoids spawning PowerShell unless a candidate exists.
+	out, err := exec.Command("tasklist", "/FO", "CSV", "/NH").Output()
+	if err != nil {
+		return false
+	}
+	var candidates []string
+	for _, line := range strings.Split(string(out), "\n") {
+		name, pid, ok := parseWindowsTasklistCSVLine(line)
+		if !ok || pid == selfPID {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if strings.Contains(lower, "antigravity") || lower == "electron.exe" {
+			candidates = append(candidates, name)
+		}
+	}
+	if len(candidates) == 0 {
+		return false
+	}
+	// Refine with full command lines so Desktop vs IDE and T3 ACP harnesses are separated accurately.
+	psOut, err := exec.Command(
+		"powershell", "-NoProfile", "-NonInteractive", "-Command",
+		`Get-CimInstance Win32_Process -Filter "Name LIKE '%antigravity%' OR Name = 'electron.exe'" | ForEach-Object { "$($_.ProcessId)`+"\t"+`$($_.CommandLine)" }`,
+	).Output()
+	if err == nil && len(strings.TrimSpace(string(psOut))) > 0 {
+		for _, line := range strings.Split(string(psOut), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			pidStr, cmdline, ok := strings.Cut(line, "\t")
+			if !ok {
+				continue
+			}
+			if pid, err := strconv.Atoi(strings.TrimSpace(pidStr)); err == nil && pid == selfPID {
+				continue
+			}
+			if matchAntigravityProcess(cmdline, surface) {
+				return true
+			}
+		}
+		return false
+	}
+	// Fallback if PowerShell is unavailable: match directly on image names.
+	for _, name := range candidates {
+		if matchAntigravityProcess(name, surface) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseWindowsTasklistCSVLine(line string) (name string, pid int, ok bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, `"`) {
+		return "", 0, false
+	}
+	// Format: "Image Name","PID","Session Name","Session#","Mem Usage"
+	parts := strings.Split(line, `","`)
+	if len(parts) < 2 {
+		return "", 0, false
+	}
+	name = strings.TrimPrefix(parts[0], `"`)
+	pidStr := strings.TrimSuffix(parts[1], `"`)
+	pid, err := strconv.Atoi(strings.TrimSpace(pidStr))
+	if err != nil || pid <= 0 {
+		return "", 0, false
+	}
+	return name, pid, true
 }
 
 func matchAntigravityProcess(cmdline, surface string) bool {
@@ -307,8 +381,13 @@ func matchAntigravityProcess(cmdline, surface string) bool {
 	}
 	fields := strings.Fields(lower)
 	if len(fields) > 0 {
-		base := filepath.Base(fields[0])
-		if base == "tori" || base == "agy" || base == "grep" || base == "rg" || base == "ps" {
+		arg0 := strings.Trim(fields[0], `"'`)
+		arg0 = strings.ReplaceAll(arg0, `\`, "/")
+		if idx := strings.LastIndexByte(arg0, '/'); idx >= 0 {
+			arg0 = arg0[idx+1:]
+		}
+		base := strings.TrimSuffix(arg0, ".exe")
+		if base == "tori" || base == "agy" || base == "grep" || base == "rg" || base == "ps" || base == "powershell" || base == "pwsh" || base == "tasklist" {
 			return false
 		}
 	}
@@ -327,7 +406,7 @@ func matchAntigravityProcess(cmdline, surface string) bool {
 			strings.Contains(lower, `\antigravity`) ||
 			strings.Contains(lower, "antigravity.app") ||
 			strings.Contains(lower, "antigravity.exe") ||
-			(len(fields) > 0 && filepath.Base(fields[0]) == "antigravity")
+			(len(fields) > 0 && strings.TrimSuffix(filepath.Base(strings.ReplaceAll(strings.Trim(fields[0], `"'`), `\`, "/")), ".exe") == "antigravity")
 	default:
 		return false
 	}
@@ -414,8 +493,12 @@ func agyBinaryCandidates(env *Env) []string {
 		}
 	}
 	if env.Home != "" {
-		add(filepath.Join(env.Home, ".local", "bin", "agy"))
-		add(filepath.Join(env.Home, ".gemini", "antigravity-cli", "bin", "agy"))
+		binName := "agy"
+		if env.GOOS == "windows" {
+			binName = "agy.exe"
+		}
+		add(filepath.Join(env.Home, ".local", "bin", binName))
+		add(filepath.Join(env.Home, ".gemini", "antigravity-cli", "bin", binName))
 	}
 	// Only scan system install paths when LookPath is configured (avoids leaking host binaries into isolated unit tests).
 	if env.LookPath != nil {
@@ -437,6 +520,21 @@ func agyBinaryCandidates(env *Env) []string {
 			addGlob("/opt/Antigravity/resources/app/extensions/antigravity/bin/language_server_*")
 			addGlob("/usr/lib/antigravity-ide/extensions/antigravity/bin/language_server_*")
 			addGlob("/usr/share/antigravity-ide/resources/app/extensions/antigravity/bin/language_server_*")
+		case "windows":
+			var bases []string
+			if local := env.getenv("LOCALAPPDATA"); local != "" {
+				bases = append(bases, filepath.Join(local, "Programs"))
+			} else if env.Home != "" {
+				bases = append(bases, filepath.Join(env.Home, "AppData", "Local", "Programs"))
+			}
+			if pf := env.getenv("ProgramFiles"); pf != "" {
+				bases = append(bases, pf)
+			}
+			for _, base := range bases {
+				for _, app := range []string{"Antigravity", "Antigravity IDE", "AntigravityIDE"} {
+					addGlob(filepath.Join(base, app, "resources", "app", "extensions", "antigravity", "bin", "language_server_*"))
+				}
+			}
 		}
 	}
 	return out

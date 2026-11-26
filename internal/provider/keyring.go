@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/zalando/go-keyring"
@@ -16,6 +17,8 @@ const (
 	goKeyringBase64Prefix = "go-keyring-base64:"
 	// macOS `security -i` has a 4,095-byte stdin line limit; stay safely below it.
 	darwinSecurityInteractiveMaxLen = 4000
+	// Windows Credential Manager generic credential blob limit.
+	windowsCredMaxBlobBytes = 2560
 )
 
 func isKeyringNotFound(err error) bool {
@@ -80,4 +83,78 @@ func buildSecurityAddCommand(service, user, secret string) string {
 		quoteSecurityArg(service),
 		hex.EncodeToString([]byte(secret)),
 	)
+}
+
+// windowsCredTargetNames returns Windows Credential Manager target names in preferred order.
+// Rust's keyring crate (used by Codex) stores "<user>.<service>", while Go's go-keyring
+// (used by Go CLI tools) stores "<service>:<user>".
+func windowsCredTargetNames(service, user string) []string {
+	rustStyle := user + "." + service
+	goStyle := service + ":" + user
+	if service == codexKeyringService {
+		return []string{rustStyle, goStyle}
+	}
+	return []string{goStyle, rustStyle}
+}
+
+func isRustStyleWindowsTarget(target, service, user string) bool {
+	return target == user+"."+service
+}
+
+// isWindowsUTF16LEBlob detects UTF-16LE encoded ASCII/JSON Credential Manager blobs
+// (as written by Rust's `keyring` crate via `str::encode_utf16`).
+func isWindowsUTF16LEBlob(blob []byte) bool {
+	if len(blob) < 2 || len(blob)%2 != 0 || blob[0] == 0 {
+		return false
+	}
+	nulOdd := 0
+	check := len(blob)
+	if check > 32 {
+		check = 32
+	}
+	for i := 1; i < check; i += 2 {
+		if blob[i] == 0 {
+			nulOdd++
+		}
+	}
+	return nulOdd > 0 && nulOdd >= (check/2)-2
+}
+
+// encodeWindowsUTF16LE encodes s as UTF-16LE bytes without a trailing NUL,
+// matching Rust's `keyring` crate on Windows (`str::encode_utf16`).
+func encodeWindowsUTF16LE(s string) []byte {
+	units := utf16.Encode([]rune(s))
+	out := make([]byte, len(units)*2)
+	for i, u := range units {
+		out[2*i] = byte(u)
+		out[2*i+1] = byte(u >> 8)
+	}
+	return out
+}
+
+// encodeWindowsCredBlob encodes secret for Windows Credential Manager:
+// Rust-style targets ("<user>.<service>") and existing UTF-16LE entries are encoded as UTF-16LE
+// so Rust's `keyring` crate (`String::from_utf16`) reads them cleanly; Go-style targets use UTF-8.
+func encodeWindowsCredBlob(target, service, user, secret string, existingBlob []byte) []byte {
+	if isRustStyleWindowsTarget(target, service, user) || isWindowsUTF16LEBlob(existingBlob) {
+		return encodeWindowsUTF16LE(secret)
+	}
+	return []byte(secret)
+}
+
+// decodeWindowsCredBlob decodes raw Windows Credential Manager bytes, handling both
+// plain UTF-8 (go-keyring / wincred) and UTF-16LE (Rust keyring / native Windows entries).
+func decodeWindowsCredBlob(blob []byte) string {
+	if isWindowsUTF16LEBlob(blob) {
+		u16 := make([]uint16, len(blob)/2)
+		for i := range u16 {
+			u16[i] = uint16(blob[2*i]) | uint16(blob[2*i+1])<<8
+		}
+		// Trim trailing NUL if present.
+		for len(u16) > 0 && u16[len(u16)-1] == 0 {
+			u16 = u16[:len(u16)-1]
+		}
+		return string(utf16.Decode(u16))
+	}
+	return string(blob)
 }

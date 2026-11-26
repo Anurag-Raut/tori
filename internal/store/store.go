@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
+	"time"
 )
 
 // Meta holds per-slot metadata persisted in meta.json.
@@ -58,9 +60,11 @@ func WriteBytesAtomic(path string, data []byte, mode os.FileMode, keep bool) err
 		}
 	}()
 
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return err
+	if runtime.GOOS != "windows" {
+		if err := tmp.Chmod(mode); err != nil {
+			_ = tmp.Close()
+			return err
+		}
 	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
@@ -69,11 +73,26 @@ func WriteBytesAtomic(path string, data []byte, mode os.FileMode, keep bool) err
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := renameAtomic(tmpName, path); err != nil {
 		return err
 	}
 	cleanup = false
 	return nil
+}
+
+func renameAtomic(tmpName, dst string) error {
+	err := os.Rename(tmpName, dst)
+	if err == nil || runtime.GOOS != "windows" {
+		return err
+	}
+	// On Windows, transient antivirus/indexer handles can briefly block replacing dst.
+	for i := 0; i < 5; i++ {
+		time.Sleep(time.Duration(i+1) * 20 * time.Millisecond)
+		if err = os.Rename(tmpName, dst); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // WriteJSONAtomic marshals v as indented JSON and writes it atomically.
