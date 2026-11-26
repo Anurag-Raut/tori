@@ -42,11 +42,11 @@
     "arm64"
   ],
   "optionalDependencies": {
-    "tori-cli-linux-x64": "0.0.0",
-    "tori-cli-linux-arm64": "0.0.0",
-    "tori-cli-darwin-x64": "0.0.0",
-    "tori-cli-darwin-arm64": "0.0.0",
-    "tori-cli-win32-x64": "0.0.0",
-    "tori-cli-win32-arm64": "0.0.0"
+    "tori-switch-linux-x64": "0.0.0",
+    "tori-switch-linux-arm64": "0.0.0",
+    "tori-switch-darwin-x64": "0.0.0",
+    "tori-switch-darwin-arm64": "0.0.0",
+    "@anurag-raut/tori-switch-win32-x64": "0.0.0",
+    "@anurag-raut/tori-switch-win32-arm64": "0.0.0"
   }
 }

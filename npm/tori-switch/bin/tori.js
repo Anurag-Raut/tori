@@ -4,12 +4,12 @@
 const { spawnSync } = require("node:child_process");
 
 const PLATFORMS = {
-  "linux-x64": "tori-cli-linux-x64",
-  "linux-arm64": "tori-cli-linux-arm64",
-  "darwin-x64": "tori-cli-darwin-x64",
-  "darwin-arm64": "tori-cli-darwin-arm64",
-  "win32-x64": "tori-cli-win32-x64",
-  "win32-arm64": "tori-cli-win32-arm64",
+  "linux-x64": "tori-switch-linux-x64",
+  "linux-arm64": "tori-switch-linux-arm64",
+  "darwin-x64": "tori-switch-darwin-x64",
+  "darwin-arm64": "tori-switch-darwin-arm64",
+  "win32-x64": "@anurag-raut/tori-switch-win32-x64",
+  "win32-arm64": "@anurag-raut/tori-switch-win32-arm64",
 };
 
 const key = `${process.platform}-${process.arch}`;

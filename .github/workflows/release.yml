@@ -34,12 +34,12 @@ jobs:
       - name: Publish to npm
         run: |
           for dir in \
-            dist/npm/tori-cli-linux-x64 \
-            dist/npm/tori-cli-linux-arm64 \
-            dist/npm/tori-cli-darwin-x64 \
-            dist/npm/tori-cli-darwin-arm64 \
-            dist/npm/tori-cli-win32-x64 \
-            dist/npm/tori-cli-win32-arm64 \
+            dist/npm/tori-switch-linux-x64 \
+            dist/npm/tori-switch-linux-arm64 \
+            dist/npm/tori-switch-darwin-x64 \
+            dist/npm/tori-switch-darwin-arm64 \
+            dist/npm/@anurag-raut/tori-switch-win32-x64 \
+            dist/npm/@anurag-raut/tori-switch-win32-arm64 \
             dist/npm/tori-switch
           do
             name="$(node -p "require('./$dir/package.json').name")"

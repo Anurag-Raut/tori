@@ -7,12 +7,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 
 const TARGETS = [
-  { pkg: "tori-cli-linux-x64", os: "linux", cpu: "x64", goos: "linux", goarch: "amd64", bin: "tori" },
-  { pkg: "tori-cli-linux-arm64", os: "linux", cpu: "arm64", goos: "linux", goarch: "arm64", bin: "tori" },
-  { pkg: "tori-cli-darwin-x64", os: "darwin", cpu: "x64", goos: "darwin", goarch: "amd64", bin: "tori" },
-  { pkg: "tori-cli-darwin-arm64", os: "darwin", cpu: "arm64", goos: "darwin", goarch: "arm64", bin: "tori" },
-  { pkg: "tori-cli-win32-x64", os: "win32", cpu: "x64", goos: "windows", goarch: "amd64", bin: "tori.exe" },
-  { pkg: "tori-cli-win32-arm64", os: "win32", cpu: "arm64", goos: "windows", goarch: "arm64", bin: "tori.exe" },
+  { pkg: "tori-switch-linux-x64", os: "linux", cpu: "x64", goos: "linux", goarch: "amd64", bin: "tori" },
+  { pkg: "tori-switch-linux-arm64", os: "linux", cpu: "arm64", goos: "linux", goarch: "arm64", bin: "tori" },
+  { pkg: "tori-switch-darwin-x64", os: "darwin", cpu: "x64", goos: "darwin", goarch: "amd64", bin: "tori" },
+  { pkg: "tori-switch-darwin-arm64", os: "darwin", cpu: "arm64", goos: "darwin", goarch: "arm64", bin: "tori" },
+  { pkg: "@anurag-raut/tori-switch-win32-x64", os: "win32", cpu: "x64", goos: "windows", goarch: "amd64", bin: "tori.exe" },
+  { pkg: "@anurag-raut/tori-switch-win32-arm64", os: "win32", cpu: "arm64", goos: "windows", goarch: "arm64", bin: "tori.exe" },
 ];
 
 function parseArgs(argv) {
