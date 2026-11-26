@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"strings"
+
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
@@ -145,7 +147,8 @@ type rowStyles struct {
 	text    lipgloss.Style
 	email   lipgloss.Style
 	dim     lipgloss.Style
-	badge   lipgloss.Style
+	badge   lipgloss.Style            // plans without their own shade
+	badges  map[string]lipgloss.Style // keyed by badgeKey(plan)
 	good    lipgloss.Style
 	warn    lipgloss.Style
 	bad     lipgloss.Style
@@ -211,6 +214,29 @@ func newTheme(ascii bool) theme {
 	codexC := lipgloss.AdaptiveColor{Light: "#11786b", Dark: "#73daca"}
 	agyC := lipgloss.AdaptiveColor{Light: "#2a57c7", Dark: "#7aa2f7"}
 
+	// Plan badges: one shade per tier so accounts are easy to tell apart.
+	type shade struct{ fg, bg lipgloss.AdaptiveColor }
+	newShade := func(lightFg, lightBg, darkFg, darkBg string) shade {
+		return shade{
+			fg: lipgloss.AdaptiveColor{Light: lightFg, Dark: darkFg},
+			bg: lipgloss.AdaptiveColor{Light: lightBg, Dark: darkBg},
+		}
+	}
+	green := newShade("#0f5c52", "#cdebe5", "#9ee8da", "#1f4a45")
+	amber := newShade("#6e4a0c", "#f3e2c0", "#f2cf95", "#54401f")
+	planShades := map[string]shade{
+		"free":       newShade("#454a63", "#e0e1e8", "#a4a9c0", "#33354a"),
+		"go":         green,
+		"plus":       green,
+		"pro":        newShade("#1d438f", "#d3e0fb", "#bcd2ff", "#2d4a85"),
+		"max":        newShade("#52298f", "#e6d8fb", "#dcc8ff", "#503584"),
+		"team":       amber,
+		"business":   amber,
+		"enterprise": amber,
+		"edu":        amber,
+		"api":        newShade("#8a2450", "#f6d6e3", "#f6bdd3", "#5a2c42"),
+	}
+
 	buildRow := func(bg *lipgloss.AdaptiveColor, selected bool) rowStyles {
 		base := lipgloss.NewStyle()
 		if bg != nil {
@@ -224,7 +250,12 @@ func newTheme(ascii bool) theme {
 		if selected {
 			emailStyle = textBase.Foreground(textStrongC)
 		}
+		badges := make(map[string]lipgloss.Style, len(planShades))
+		for plan, s := range planShades {
+			badges[plan] = textBase.Foreground(s.fg).Background(s.bg)
+		}
 		return rowStyles{
+			badges:  badges,
 			space:   base,
 			text:    textBase,
 			email:   emailStyle,
@@ -294,6 +325,19 @@ func newTheme(ascii bool) theme {
 		inputText:   lipgloss.NewStyle(),
 		inputPlace:  lipgloss.NewStyle().Foreground(dimC),
 	}
+}
+
+// badgeKey maps a plan label to its shade, e.g. "Max 5x" -> "max".
+func badgeKey(plan string) string {
+	first, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(plan)), " ")
+	return first
+}
+
+func (rs rowStyles) planStyle(plan string) lipgloss.Style {
+	if s, ok := rs.badges[badgeKey(plan)]; ok {
+		return s
+	}
+	return rs.badge
 }
 
 func (t theme) toolStyle(key string) lipgloss.Style {

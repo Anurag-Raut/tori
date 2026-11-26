@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -1189,5 +1190,20 @@ func TestAliasTagAndPlanBadge(t *testing.T) {
 	}
 	if got := planBadge("", 6, rs, "…"); got != "" {
 		t.Fatalf("expected no badge for empty plan, got %q", got)
+	}
+}
+
+func TestPlanBadgeShades(t *testing.T) {
+	rs := newTheme(false).rowNormal
+	seen := map[string]string{}
+	for _, plan := range []string{"Free", "Plus", "Pro", "Max", "Team", "API", "Mystery"} {
+		bg := fmt.Sprint(rs.planStyle(plan).GetBackground())
+		if other, dup := seen[bg]; dup {
+			t.Fatalf("%s and %s share a badge shade", plan, other)
+		}
+		seen[bg] = plan
+	}
+	if rs.planStyle("Max 5x").GetBackground() != rs.planStyle("max").GetBackground() {
+		t.Fatal("expected a plan variant to use its tier shade")
 	}
 }

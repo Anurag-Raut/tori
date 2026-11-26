@@ -61,7 +61,7 @@ func planBadge(plan string, maxW int, rs rowStyles, ellipsis string) string {
 	if plan == "" || maxW < 3 {
 		return ""
 	}
-	return rs.badge.Render(" " + ansi.Truncate(plan, maxW-2, ellipsis) + " ")
+	return rs.planStyle(plan).Render(" " + ansi.Truncate(plan, maxW-2, ellipsis) + " ")
 }
 
 // renderWideAccountRow renders one account as a single horizontal line of fixed-width cells.

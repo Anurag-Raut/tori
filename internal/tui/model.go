@@ -1403,7 +1403,7 @@ func (m Model) rowStylesFor(selected, hovered bool) rowStyles {
 }
 
 func (m Model) renderHeader() string {
-	left := " " + m.theme.brand.Render("tori")
+	left := " " + m.theme.brand.Render("Tori")
 
 	var right string
 	switch {
