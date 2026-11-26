@@ -14,7 +14,7 @@
 
 ## Highlights
 
-- **Three tools, one picker** — manage multiple **Claude Code**, **Codex CLI**, and **Antigravity** (T3 Code) logins side by side.
+- **Three tools, one picker** — manage multiple **Claude Code**, **Codex CLI**, and **Antigravity** (Desktop, IDE, CLI `agy`, and T3 Code) logins side by side.
 - **Live quota and pace bars** — see remaining 5-hour and 7-day quota, reset timers, and whether you're ahead or behind pace across every saved account.
 - **No proxy, no daemon** — Tori swaps your own local login files atomically (`0600`) when you ask it to. Your tools keep talking directly to their providers.
 - **Interactive TUI + scriptable CLI** — navigate with keyboard or mouse in the Bubble Tea picker, or automate workflows with subcommands and `--json`.
@@ -82,14 +82,16 @@ tori x add Personal
 
 Codex reads its login at startup, so restart `codex` after switching.
 
-### Antigravity (T3 Code)
+### Antigravity
+
+Works automatically with **Antigravity Desktop / Classic**, **Antigravity IDE**, **Antigravity CLI (`agy`)**, and **T3 Code** (no T3 Code required):
 
 ```bash
-tori g add Primary # while signed in to Antigravity in T3 Code
+tori g add Primary # while signed in to Antigravity Desktop, IDE, CLI, or T3 Code
 tori g add Backup  # after signing in with your next account
 ```
 
-The alias is optional — Tori picks up the Google email automatically when quota loads. Restart any running Antigravity session after switching.
+The alias is optional — Tori reads the email directly from native logins (and learns it when quota loads for legacy T3 tokens). Close Antigravity Desktop/IDE before switching so its local database isn't overwritten, and restart `agy` or T3 Code sessions after switching.
 
 ### Platform support
 
@@ -97,7 +99,7 @@ The alias is optional — Tori picks up the Google email automatically when quot
 |---|---|---|---|
 | **Claude Code** | Supported | Not yet | macOS stores Claude logins in Keychain rather than `~/.claude/.credentials.json` |
 | **Codex CLI** | Supported | Supported | Supports both ChatGPT OAuth and API-key logins |
-| **Antigravity** | Supported | Supported | Reads T3 Code's local `acp_token.json` |
+| **Antigravity** | Supported | Supported | Supports Desktop/Classic & IDE (`state.vscdb`), CLI `agy` & Desktop 2.x (OS keyring + token files), and T3 Code (`acp_token.json` / `antigravity-oauth-token`) |
 
 ## Reading the quota bars
 
@@ -161,7 +163,7 @@ Preferences live in `~/.tori/config.json` and saved credentials under `~/.tori/{
 | `NO_COLOR=1` | Monochrome output |
 | `CLAUDE_CONFIG_DIR`, `TORI_CLAUDE_CREDS`, `TORI_CLAUDE_CONFIG` | Override Claude Code credential/config paths |
 | `CODEX_HOME`, `TORI_CODEX_AUTH` | Override Codex CLI auth path |
-| `TORI_AGY_TOKEN` | Override Antigravity `acp_token.json` path |
+| `TORI_AGY_TOKEN`, `TORI_AGY_DESKTOP_DB`, `TORI_AGY_IDE_DB`, `TORI_AGY_CLI_TOKEN`, `TORI_AGY_DESKTOP_TOKEN` | Override Antigravity token or `state.vscdb` paths |
 
 ## Privacy & terms
 

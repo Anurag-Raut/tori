@@ -62,6 +62,14 @@ func HTTPStatusText(code int) string {
 	}
 }
 
+// KeyringStore abstracts OS keyring access so production uses the system keyring
+// while tests can inject an in-memory store or leave it nil to disable keyring I/O.
+type KeyringStore interface {
+	Get(service, user string) (string, error)
+	Set(service, user, secret string) error
+	Delete(service, user string) error
+}
+
 // Env holds runtime configuration, filesystem overrides, clock, and HTTP client.
 type Env struct {
 	Root           string
@@ -76,6 +84,9 @@ type Env struct {
 	ASCII          bool
 	Warn           func(string)
 	Environ        func(string) string
+	Keyring        KeyringStore
+	ProcessRunning func(surface string) bool
+	LookPath       func(name string) (string, error)
 }
 
 // NewEnv constructs a default Env from process environment variables.
@@ -92,7 +103,10 @@ func NewEnv() *Env {
 		Warn: func(msg string) {
 			fmt.Fprintf(os.Stderr, "tori: %s\n", msg)
 		},
-		Environ: os.Getenv,
+		Environ:        os.Getenv,
+		Keyring:        osKeyring{},
+		ProcessRunning: isAntigravityProcessRunning,
+		LookPath:       defaultLookPath,
 	}
 }
 
@@ -369,7 +383,10 @@ func Switch(env *Env, p Provider, ref string) ([]string, error) {
 
 // Remove removes the resolved slot and compacts remaining slots to 1..N.
 func Remove(env *Env, p Provider, slot store.Slot) (string, error) {
-	renumbered, err := store.RemoveSlot(env.Root, p.Key(), p.SlotFile(), slot.Number)
+	if err := os.RemoveAll(slot.Dir); err != nil {
+		return "", err
+	}
+	renumbered, err := p.Compact(env)
 	if err != nil {
 		return "", err
 	}

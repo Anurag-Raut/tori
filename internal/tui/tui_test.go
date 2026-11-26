@@ -1207,3 +1207,37 @@ func TestPlanBadgeShades(t *testing.T) {
 		t.Fatal("expected a plan variant to use its tier shade")
 	}
 }
+
+func TestDialogAddSignInRecheckNotFound(t *testing.T) {
+	withASCIIProfile(t)
+	env, _ := setupTestEnv(t, nil)
+	env.DisableNetwork = true
+
+	m := NewModel(env)
+	agy := provider.Find("antigravity")
+	if agy == nil {
+		t.Fatal("expected antigravity provider")
+	}
+
+	// Initial open (not installed): no warning yet.
+	m, _ = execCmd(m, checkAddStatusCmd(env, agy, false))
+	if m.dlg.kind != dialogAddSignIn || m.dlg.notFound {
+		t.Fatalf("expected initial dialogAddSignIn without notFound, got kind=%v notFound=%v", m.dlg.kind, m.dlg.notFound)
+	}
+	initialView := m.View()
+	if strings.Contains(initialView, "No login found yet.") {
+		t.Fatalf("did not expect warning on initial open:\n%s", initialView)
+	}
+
+	// Press Enter to re-check while still not installed -> shows warning and status message.
+	next, cmd := m.Update(keyType(tea.KeyEnter))
+	m = next.(Model)
+	m, _ = execCmd(m, cmd)
+	if m.dlg.kind != dialogAddSignIn || !m.dlg.notFound {
+		t.Fatalf("expected dialogAddSignIn with notFound=true after recheck, got kind=%v notFound=%v", m.dlg.kind, m.dlg.notFound)
+	}
+	recheckView := m.View()
+	if !strings.Contains(recheckView, "No login found yet.") || !strings.Contains(recheckView, "Antigravity not found") {
+		t.Fatalf("expected not-found warning in dialog:\n%s", recheckView)
+	}
+}

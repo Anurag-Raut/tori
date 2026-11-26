@@ -132,6 +132,12 @@ func isAllDigits(s string) bool {
 // Slots returns all valid slots for a provider sorted ascending by slot number.
 // A slot directory is valid if its name is numeric (> 0) and slotFile exists inside it.
 func Slots(root, key, slotFile string) ([]Slot, error) {
+	return SlotsAny(root, key, slotFile)
+}
+
+// SlotsAny returns all valid slots for a provider sorted ascending by slot number.
+// A slot directory is valid if its name is numeric (> 0) and any of slotFiles exists inside it.
+func SlotsAny(root, key string, slotFiles ...string) ([]Slot, error) {
 	acctDir := AccountsDir(root, key)
 	entries, err := os.ReadDir(acctDir)
 	if err != nil {
@@ -150,7 +156,17 @@ func Slots(root, key, slotFile string) ([]Slot, error) {
 			continue
 		}
 		dir := filepath.Join(acctDir, ent.Name())
-		if _, err := os.Stat(filepath.Join(dir, slotFile)); err != nil {
+		hasFile := false
+		for _, sf := range slotFiles {
+			if sf == "" {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(dir, sf)); err == nil {
+				hasFile = true
+				break
+			}
+		}
+		if !hasFile {
 			continue
 		}
 		var meta Meta
@@ -166,7 +182,12 @@ func Slots(root, key, slotFile string) ([]Slot, error) {
 // Compact renumbers slots to contiguous 1..N using a two-phase rename so names never collide.
 // Returns true if any renumbering occurred.
 func Compact(root, key, slotFile string) (bool, error) {
-	slots, err := Slots(root, key, slotFile)
+	return CompactAny(root, key, slotFile)
+}
+
+// CompactAny renumbers slots matched by any of slotFiles to contiguous 1..N.
+func CompactAny(root, key string, slotFiles ...string) (bool, error) {
+	slots, err := SlotsAny(root, key, slotFiles...)
 	if err != nil {
 		return false, err
 	}

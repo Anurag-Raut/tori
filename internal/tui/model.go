@@ -763,6 +763,7 @@ func (m Model) handleAddStatus(msg addStatusMsg) (Model, tea.Cmd) {
 	if st.LoggedIn && st.ManagedSlot == nil {
 		m.dlg.kind = dialogAddSave
 		m.dlg.stillSameLogin = false
+		m.dlg.notFound = false
 		m.dlg.account = nil
 		m.aliasInput.Reset()
 		return m, m.aliasInput.Focus()
@@ -770,6 +771,7 @@ func (m Model) handleAddStatus(msg addStatusMsg) (Model, tea.Cmd) {
 
 	// Case 2: Signed in to an already-saved slot.
 	if st.LoggedIn && st.ManagedSlot != nil {
+		m.dlg.notFound = false
 		slotN := *st.ManagedSlot
 		if msg.recheck {
 			// If still signed in to the exact same saved slot we started with,
@@ -806,6 +808,7 @@ func (m Model) handleAddStatus(msg addStatusMsg) (Model, tea.Cmd) {
 	// Case 3: Not signed in yet -> Step 2 (Sign in).
 	m.dlg.kind = dialogAddSignIn
 	m.dlg.stillSameLogin = false
+	m.dlg.notFound = msg.recheck
 	if !msg.recheck {
 		m.dlg.initialSlot = nil
 	}
