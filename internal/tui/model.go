@@ -805,9 +805,9 @@ func (m Model) handleAddStatus(msg addStatusMsg) (Model, tea.Cmd) {
 
 	// Case 3: Not signed in yet -> Step 2 (Sign in).
 	m.dlg.kind = dialogAddSignIn
+	m.dlg.stillSameLogin = false
 	if !msg.recheck {
 		m.dlg.initialSlot = nil
-		m.dlg.stillSameLogin = false
 	}
 	return m, nil
 }
@@ -1403,7 +1403,7 @@ func (m Model) rowStylesFor(selected, hovered bool) rowStyles {
 }
 
 func (m Model) renderHeader() string {
-	left := " " + m.theme.brand.Render("tori")
+	left := " " + m.theme.brand.Render("Tori")
 
 	var right string
 	switch {
