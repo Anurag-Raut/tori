@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Anurag-Raut/tori/internal/provider"
 )
@@ -45,6 +46,24 @@ func renderErrorToolRow(rs rowStyles, width int, g glyphs) string {
 	)
 }
 
+// aliasTag formats an alias as "[alias]" in at most maxW cells, truncating
+// inside the brackets. It returns "" for an empty alias.
+func aliasTag(alias string, maxW int, ellipsis string) string {
+	if alias == "" || maxW < 3 {
+		return ""
+	}
+	return "[" + ansi.Truncate(alias, maxW-2, ellipsis) + "]"
+}
+
+// planBadge renders a plan label on a filled background in at most maxW cells,
+// including one cell of padding on each side. It returns "" for an empty label.
+func planBadge(plan string, maxW int, rs rowStyles, ellipsis string) string {
+	if plan == "" || maxW < 3 {
+		return ""
+	}
+	return rs.badge.Render(" " + ansi.Truncate(plan, maxW-2, ellipsis) + " ")
+}
+
 // renderWideAccountRow renders one account as a single horizontal line of fixed-width cells.
 func renderWideAccountRow(
 	acct provider.AccountEntry,
@@ -74,19 +93,20 @@ func renderWideAccountRow(
 	emailText := truncateEmail(acct.Email, max(1, cols.emailW-1), g.ellipsis)
 	cells = append(cells, rs.email.Render(fitCell(emailText, cols.emailW, false)))
 
-	// Alias (dim, blank if none)
+	// Alias as a "[tag]" (dim, blank if none; 1-cell gap after)
 	if cols.aliasW > 0 {
-		alias := ""
+		tag := ""
 		if acct.Alias != nil {
-			alias = *acct.Alias
+			tag = aliasTag(*acct.Alias, cols.aliasW-1, g.ellipsis)
 		}
-		cells = append(cells, rs.dim.Render(fitColumn(alias, cols.aliasW, 1, g.ellipsis)))
+		cells = append(cells, rs.dim.Render(fitCell(tag, cols.aliasW, false)))
 	}
 
-	// Plan (dim, blank if none, "API" for API-key accounts)
+	// Plan badge (blank if none, "API" for API-key accounts; 1-cell gap after)
 	if cols.planW > 0 {
-		plan := planLabel(acct)
-		cells = append(cells, rs.dim.Render(fitColumn(plan, cols.planW, 1, g.ellipsis)))
+		badge := planBadge(planLabel(acct), cols.planW-1, rs, g.ellipsis)
+		pad := max(0, cols.planW-lipgloss.Width(badge))
+		cells = append(cells, badge+rs.space.Render(strings.Repeat(" ", pad)))
 	}
 
 	// Window area (54 cells in standard 2-window layout)
@@ -432,19 +452,30 @@ func renderNarrowExpanded(
 	indent := rs.space.Render(strings.Repeat(" ", indentW))
 	rPad := rs.space.Render(" ")
 
-	// Line 2: alias · plan (if either is present)
-	var metaParts []string
-	if acct.Alias != nil && *acct.Alias != "" {
-		metaParts = append(metaParts, *acct.Alias)
+	// Line 2: [alias] tag and plan badge (if either is present)
+	plan := planLabel(acct)
+	meta := ""
+	if acct.Alias != nil {
+		// Leave room for the gap and badge so a long alias never pushes it off.
+		reserved := 0
+		if plan != "" {
+			reserved = lipgloss.Width(plan) + 3
+		}
+		if tag := aliasTag(*acct.Alias, innerW-reserved, g.ellipsis); tag != "" {
+			meta = rs.dim.Render(tag)
+		}
 	}
-	if pl := planLabel(acct); pl != "" {
-		metaParts = append(metaParts, pl)
+	if plan != "" {
+		if meta != "" {
+			meta += rs.space.Render(" ")
+		}
+		meta += planBadge(plan, innerW-lipgloss.Width(meta), rs, g.ellipsis)
 	}
-	if len(metaParts) > 0 {
-		metaText := strings.Join(metaParts, " "+g.sep+" ")
+	if meta != "" {
+		pad := max(0, innerW-lipgloss.Width(meta))
 		lines = append(lines, lipgloss.JoinHorizontal(lipgloss.Top,
 			indent,
-			rs.dim.Render(fitCell(metaText, innerW, false)),
+			meta+rs.space.Render(strings.Repeat(" ", pad)),
 			rPad,
 		))
 	}

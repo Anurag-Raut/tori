@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Anurag-Raut/tori/internal/config"
 	"github.com/Anurag-Raut/tori/internal/provider"
@@ -201,6 +202,19 @@ func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
 		if m.dlg.stillSameLogin {
 			lines = append(lines, "")
 			addWrappedPrefix(m.glyphs.warn+" ", "Still signed in as the saved account.", m.theme.warn)
+			if slot := m.dlg.status.ManagedSlot; slot != nil {
+				name := m.dlg.status.DisplayName
+				meta := []string{fmt.Sprintf("Slot %d", *slot)}
+				if m.dlg.provider != nil {
+					for _, a := range m.data[m.dlg.provider.Key()] {
+						if a.Number == *slot && a.Alias != nil && *a.Alias != "" {
+							meta = append(meta, "["+*a.Alias+"]")
+						}
+					}
+				}
+				lines = append(lines, m.theme.text.Render("  "+ansi.Truncate(name, innerW-2, m.glyphs.ellipsis)))
+				lines = append(lines, m.theme.dim.Render("  "+ansi.Truncate(strings.Join(meta, " "+m.glyphs.sep+" "), innerW-2, m.glyphs.ellipsis)))
+			}
 			addWrappedPrefix("  ", "Sign in with a different one.", m.theme.dim)
 		}
 		hintLine = renderHint(m.glyphs.keyEnter, "check again", "esc", "cancel")

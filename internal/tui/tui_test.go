@@ -521,7 +521,7 @@ func TestWideThreeWindowDegradation(t *testing.T) {
 
 	// At 112 cols, 3 windows with barW=4 fits WITH alias and plan.
 	cols112 := computeWideColumns(112, 3)
-	if cols112.barW != 4 || cols112.aliasW != 9 || cols112.planW != 5 {
+	if cols112.barW != 4 || cols112.aliasW != 11 || cols112.planW != 7 {
 		t.Fatalf("unexpected 3-window layout at 112 cols: %+v", cols112)
 	}
 }
@@ -793,6 +793,11 @@ func TestGoldenAllDialogs(t *testing.T) {
 		m.dlg.kind = dialogAddSignIn
 		m.dlg.provider = &provider.Claude{}
 		m.dlg.stillSameLogin = true
+		m.dlg.status = provider.StatusInfo{
+			LoggedIn:    true,
+			DisplayName: "work@example.com",
+			ManagedSlot: ptrInt(2),
+		}
 		assertGolden(t, "dialog_add_sign_in", m.View())
 	})
 
@@ -1078,6 +1083,9 @@ func TestMetersToggleAndAddFlow(t *testing.T) {
 	if m.dlg.kind != dialogAddSignIn || !m.dlg.stillSameLogin {
 		t.Fatalf("expected stillSameLogin warning on recheck, got kind=%v still=%v", m.dlg.kind, m.dlg.stillSameLogin)
 	}
+	if box, _, _ := m.buildDialog(); !strings.Contains(box, m.dlg.status.DisplayName) || !strings.Contains(box, "Slot 1") {
+		t.Fatalf("expected warning to name the signed-in saved account, got:\n%s", box)
+	}
 
 	// Sign in to a new account and recheck -> Step 4 (Save account).
 	_ = store.WriteJSONAtomic(filepath.Join(env.Home, ".claude", ".credentials.json"), map[string]any{
@@ -1158,5 +1166,28 @@ func TestMouseAndEnvironmentDetection(t *testing.T) {
 	m, _ = execCmd(m, cmd)
 	if !m.data["codex"][0].Active {
 		t.Fatal("expected double-click switch to activate alpha")
+	}
+}
+
+func TestAliasTagAndPlanBadge(t *testing.T) {
+	rs := newTheme(false).rowNormal
+
+	if got := aliasTag("Work", 10, "…"); got != "[Work]" {
+		t.Fatalf("expected [Work], got %q", got)
+	}
+	if got := aliasTag("a-very-long-alias", 10, "…"); got != "[a-very-…]" {
+		t.Fatalf("expected truncation inside brackets, got %q", got)
+	}
+	if got := aliasTag("", 10, "…"); got != "" {
+		t.Fatalf("expected no tag for empty alias, got %q", got)
+	}
+	if got := planBadge("Free", 6, rs, "…"); lipgloss.Width(got) != 6 || !strings.Contains(got, " Free ") {
+		t.Fatalf("expected padded 6-cell badge, got %q", got)
+	}
+	if got := planBadge("Enterprise", 6, rs, "…"); lipgloss.Width(got) != 6 {
+		t.Fatalf("expected long plan truncated to 6 cells, got %q", got)
+	}
+	if got := planBadge("", 6, rs, "…"); got != "" {
+		t.Fatalf("expected no badge for empty plan, got %q", got)
 	}
 }

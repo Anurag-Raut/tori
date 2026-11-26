@@ -145,6 +145,7 @@ type rowStyles struct {
 	text    lipgloss.Style
 	email   lipgloss.Style
 	dim     lipgloss.Style
+	badge   lipgloss.Style
 	good    lipgloss.Style
 	warn    lipgloss.Style
 	bad     lipgloss.Style
@@ -201,6 +202,7 @@ func newTheme(ascii bool) theme {
 	selectedC := lipgloss.AdaptiveColor{Light: "#e4e7f2", Dark: "#24283b"}
 	hoverC := lipgloss.AdaptiveColor{Light: "#eef0f7", Dark: "#1f2335"}
 	borderC := lipgloss.AdaptiveColor{Light: "#9aa3c8", Dark: "#3b4261"}
+	badgeC := lipgloss.AdaptiveColor{Light: "#d5d8e6", Dark: "#363c58"}
 	goodC := lipgloss.AdaptiveColor{Light: "#387020", Dark: "#9ece6a"}
 	warnC := lipgloss.AdaptiveColor{Light: "#8c5e14", Dark: "#e0af68"}
 	badC := lipgloss.AdaptiveColor{Light: "#c42847", Dark: "#f7768e"}
@@ -227,6 +229,7 @@ func newTheme(ascii bool) theme {
 			text:    textBase,
 			email:   emailStyle,
 			dim:     textBase.Foreground(dimC),
+			badge:   textBase.Foreground(keyC).Background(badgeC),
 			good:    textBase.Foreground(goodC),
 			warn:    textBase.Foreground(warnC),
 			bad:     textBase.Foreground(badC),

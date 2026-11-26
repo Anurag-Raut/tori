@@ -80,7 +80,8 @@ type wideColumns struct {
 }
 
 // computeWideColumns computes fixed cell widths for a wide account row.
-// Base (<= 2 windows, rowW=99): 1 + 2 + 2 + 25 + 9 + 5 + 26 + 2 + 26 + 1 = 99.
+// Base (<= 2 windows, rowW=99): 1 + 2 + 2 + 23 + 11 + 7 + 25 + 2 + 25 + 1 = 99.
+// When tight, <= 2 window bars shrink 10 -> 8 to keep the email column readable.
 // For 3+ windows: shrinks bar 10 -> 6 -> 4, then drops alias, then drops plan.
 // Any leftover width goes to the email column. Never exceeds rowW.
 func computeWideColumns(rowW, numWindows int) wideColumns {
@@ -91,8 +92,11 @@ func computeWideColumns(rowW, numWindows int) wideColumns {
 		rightPad  = 1
 		baseEmail = 25
 		minEmail  = 14
-		baseAlias = 9
-		basePlan  = 5
+		tagEmail  = 21 // email width required to keep alias and plan with 3+ windows
+		keepEmail = 23 // <= 2 windows: bars shrink until email gets this much
+		minBar    = 8
+		baseAlias = 11 // "[Personal]" + 1 gap
+		basePlan  = 7  // " Free " badge + 1 gap
 		winGap    = 2
 		winFixed  = 4 + 1 + 4 + 2 + 6 // label(4) + gap(1) + pct(4) + flag(2) + reset(6) = 17
 	)
@@ -107,6 +111,9 @@ func computeWideColumns(rowW, numWindows int) wideColumns {
 				add = 4
 			}
 			barW += add
+		}
+		for barW > minBar && rowW-overhead-baseAlias-basePlan-(2*(winFixed+barW)+winGap) < keepEmail {
+			barW--
 		}
 		winW := winFixed + barW
 		winAreaW := 2*winW + winGap
@@ -145,7 +152,7 @@ func computeWideColumns(rowW, numWindows int) wideColumns {
 	for _, c := range candidates {
 		winW := winFixed + c.barW
 		winAreaW := k*winW + (k-1)*winGap
-		needed := overhead + baseEmail + c.aliasW + c.planW + winAreaW
+		needed := overhead + tagEmail + c.aliasW + c.planW + winAreaW
 		if needed <= rowW {
 			emailW := rowW - overhead - c.aliasW - c.planW - winAreaW
 			return wideColumns{
