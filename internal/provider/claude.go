@@ -1,10 +1,13 @@
 package provider
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
@@ -13,9 +16,11 @@ import (
 )
 
 const (
-	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
-	claudeTokenURL = "https://platform.claude.com/v1/oauth/token"
-	claudeClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	claudeUsageURL            = "https://api.anthropic.com/api/oauth/usage"
+	claudeTokenURL            = "https://platform.claude.com/v1/oauth/token"
+	claudeClientID            = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	claudeKeychainServiceBase = "Claude Code-credentials"
+	claudeKeychainFallbackUsr = "claude-code-user"
 )
 
 // Claude implements Provider for Claude Code.
@@ -49,12 +54,20 @@ func (c *Claude) NoUsage(store.Meta) bool           { return false }
 func (c *Claude) ListNote(store.Meta) string        { return "" }
 
 func (c *Claude) livePaths(env *Env) (credsPath, cfgPath string) {
-	if cfgDir := env.getenv("CLAUDE_CONFIG_DIR"); cfgDir != "" {
-		credsPath = filepath.Join(cfgDir, ".credentials.json")
+	cfgDir := env.getenv("CLAUDE_CONFIG_DIR")
+	secDir := env.getenv("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+	if cfgDir != "" {
 		cfgPath = filepath.Join(cfgDir, ".claude.json")
 	} else {
-		credsPath = filepath.Join(env.Home, ".claude", ".credentials.json")
 		cfgPath = filepath.Join(env.Home, ".claude.json")
+	}
+	switch {
+	case secDir != "":
+		credsPath = filepath.Join(secDir, ".credentials.json")
+	case cfgDir != "":
+		credsPath = filepath.Join(cfgDir, ".credentials.json")
+	default:
+		credsPath = filepath.Join(env.Home, ".claude", ".credentials.json")
 	}
 	if v := env.getenv("TORI_CLAUDE_CREDS"); v != "" {
 		credsPath = v
@@ -65,17 +78,112 @@ func (c *Claude) livePaths(env *Env) (credsPath, cfgPath string) {
 	return credsPath, cfgPath
 }
 
+func (c *Claude) useKeychain(env *Env) bool {
+	return env.GOOS == "darwin" && env.getenv("TORI_CLAUDE_CREDS") == "" && env.Keyring != nil
+}
+
+func (c *Claude) keychainService(env *Env) string {
+	secDir := env.getenv("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+	if secDir == "" {
+		secDir = env.getenv("CLAUDE_CONFIG_DIR")
+	}
+	if secDir == "" {
+		return claudeKeychainServiceBase
+	}
+	sum := sha256.Sum256([]byte(secDir))
+	return claudeKeychainServiceBase + "-" + hex.EncodeToString(sum[:])[:8]
+}
+
+func isValidClaudeKeychainUser(u string) bool {
+	if u == "" {
+		return false
+	}
+	for i := 0; i < len(u); i++ {
+		ch := u[i]
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Claude) keychainUsers(env *Env) []string {
+	u := env.getenv("USER")
+	if u == "" && env.Environ == nil {
+		if cur, err := user.Current(); err == nil {
+			u = cur.Username
+		}
+	}
+	if isValidClaudeKeychainUser(u) && u != claudeKeychainFallbackUsr {
+		return []string{u, claudeKeychainFallbackUsr}
+	}
+	return []string{claudeKeychainFallbackUsr}
+}
+
+func (c *Claude) readKeychain(env *Env) (creds map[string]any, matchedUser string, lockedErr error) {
+	if !c.useKeychain(env) {
+		return nil, "", nil
+	}
+	service := c.keychainService(env)
+	for _, u := range c.keychainUsers(env) {
+		raw, err := env.Keyring.Get(service, u)
+		if err != nil {
+			if !isKeyringNotFound(err) && lockedErr == nil {
+				lockedErr = err
+			}
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(raw), &m); err == nil && len(m) > 0 {
+			return m, u, nil
+		}
+	}
+	return nil, "", lockedErr
+}
+
 func (c *Claude) readLive(env *Env) (oauth, account map[string]any) {
 	credsPath, cfgPath := c.livePaths(env)
-	creds := store.ReadJSONMap(credsPath)
-	cfg := store.ReadJSONMap(cfgPath)
-	if o := getMap(creds, "claudeAiOauth"); len(o) > 0 {
-		oauth = o
+	if kc, _, _ := c.readKeychain(env); kc != nil {
+		if o := getMap(kc, "claudeAiOauth"); len(o) > 0 {
+			oauth = o
+		}
 	}
+	if oauth == nil {
+		creds := store.ReadJSONMap(credsPath)
+		if o := getMap(creds, "claudeAiOauth"); len(o) > 0 {
+			oauth = o
+		}
+	}
+	cfg := store.ReadJSONMap(cfgPath)
 	if a := getMap(cfg, "oauthAccount"); len(a) > 0 {
 		account = a
 	}
 	return oauth, account
+}
+
+func (c *Claude) installed(env *Env) bool {
+	if env.LookPath != nil {
+		if _, err := env.LookPath("claude"); err == nil {
+			return true
+		}
+	}
+	credsPath, cfgPath := c.livePaths(env)
+	if fileExists(credsPath) || fileExists(cfgPath) {
+		return true
+	}
+	if dirExists(filepath.Join(env.Home, ".claude")) {
+		return true
+	}
+	if d := env.getenv("CLAUDE_CONFIG_DIR"); d != "" && dirExists(d) {
+		return true
+	}
+	if d := env.getenv("CLAUDE_SECURESTORAGE_CONFIG_DIR"); d != "" && dirExists(d) {
+		return true
+	}
+	if kc, _, _ := c.readKeychain(env); kc != nil {
+		return true
+	}
+	return false
 }
 
 func (c *Claude) accountID(oauth, account map[string]any) string {
@@ -95,13 +203,34 @@ func (c *Claude) planLabel(oauth map[string]any) string {
 
 func (c *Claude) applyLive(env *Env, oauth, account map[string]any) error {
 	credsPath, cfgPath := c.livePaths(env)
-	creds := store.ReadJSONMap(credsPath)
-	if creds == nil {
-		creds = make(map[string]any)
+	wroteKeychain := false
+	if c.useKeychain(env) {
+		service := c.keychainService(env)
+		kc, matchedUser, _ := c.readKeychain(env)
+		if kc == nil {
+			kc = make(map[string]any)
+		}
+		kc["claudeAiOauth"] = oauth
+		targetUser := matchedUser
+		if targetUser == "" {
+			targetUser = c.keychainUsers(env)[0]
+		}
+		if raw, err := json.Marshal(kc); err == nil {
+			if err := env.Keyring.Set(service, targetUser, string(raw)); err == nil {
+				wroteKeychain = true
+			}
+		}
 	}
-	creds["claudeAiOauth"] = oauth
-	if err := store.WriteJSONAtomic(credsPath, creds, 0o600, false); err != nil {
-		return err
+
+	if !wroteKeychain || fileExists(credsPath) {
+		creds := store.ReadJSONMap(credsPath)
+		if creds == nil {
+			creds = make(map[string]any)
+		}
+		creds["claudeAiOauth"] = oauth
+		if err := store.WriteJSONAtomic(credsPath, creds, 0o600, false); err != nil {
+			return err
+		}
 	}
 
 	cfg := store.ReadJSONMap(cfgPath)
@@ -180,7 +309,33 @@ func (c *Claude) ClearLive(env *Env) (func() error, error) {
 	}
 	credsPath, cfgPath := c.livePaths(env)
 
+	var kcService, kcUser, kcPriorRaw string
+	if c.useKeychain(env) {
+		kc, matchedUser, _ := c.readKeychain(env)
+		if kc != nil && matchedUser != "" {
+			if raw, err := json.Marshal(kc); err == nil {
+				kcService = c.keychainService(env)
+				kcUser = matchedUser
+				kcPriorRaw = string(raw)
+			}
+			delete(kc, "claudeAiOauth")
+			if len(kc) == 0 {
+				if err := env.Keyring.Delete(c.keychainService(env), matchedUser); err != nil {
+					return nil, err
+				}
+			} else if raw, err := json.Marshal(kc); err == nil {
+				if err := env.Keyring.Set(c.keychainService(env), matchedUser, string(raw)); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	var fileHadOAuth bool
 	if creds := store.ReadJSONMap(credsPath); creds != nil {
+		if _, ok := creds["claudeAiOauth"]; ok {
+			fileHadOAuth = true
+		}
 		delete(creds, "claudeAiOauth")
 		if err := store.WriteJSONAtomic(credsPath, creds, 0o600, false); err != nil {
 			return nil, err
@@ -194,8 +349,20 @@ func (c *Claude) ClearLive(env *Env) (func() error, error) {
 	}
 
 	restore := func() error {
-		if oauth != nil {
-			return c.applyLive(env, oauth, account)
+		if kcPriorRaw != "" && env.Keyring != nil {
+			if err := env.Keyring.Set(kcService, kcUser, kcPriorRaw); err != nil {
+				return err
+			}
+		}
+		if fileHadOAuth && oauth != nil {
+			creds := store.ReadJSONMap(credsPath)
+			if creds == nil {
+				creds = make(map[string]any)
+			}
+			creds["claudeAiOauth"] = oauth
+			if err := store.WriteJSONAtomic(credsPath, creds, 0o600, false); err != nil {
+				return err
+			}
 		}
 		if len(account) > 0 {
 			cfg := store.ReadJSONMap(cfgPath)
@@ -213,7 +380,16 @@ func (c *Claude) ClearLive(env *Env) (func() error, error) {
 func (c *Claude) Status(env *Env) (StatusInfo, error) {
 	oauth, account := c.readLive(env)
 	if oauth == nil {
-		return StatusInfo{LoggedIn: false, Message: "Not logged in to Claude Code."}, nil
+		if !c.installed(env) {
+			return StatusInfo{
+				LoggedIn: false,
+				Message:  "Claude Code is not installed. Install Claude Code, run `claude` (/login), then `tori c add`.",
+			}, nil
+		}
+		return StatusInfo{
+			LoggedIn: false,
+			Message:  "Claude Code is installed, but not logged in. Run `claude` (/login), then `tori c add`.",
+		}, nil
 	}
 	accts, _ := c.Slots(env)
 	cur := c.Current(env, accts)
@@ -232,10 +408,15 @@ func (c *Claude) Status(env *Env) (StatusInfo, error) {
 func (c *Claude) Add(env *Env, args []string) ([]string, error) {
 	oauth, account := c.readLive(env)
 	if oauth == nil {
-		if env.GOOS == "darwin" {
-			return nil, Fail("no login file found. On macOS Claude Code stores its login in the Keychain, which tori doesn't support yet.")
+		if !c.installed(env) {
+			return nil, Fail("Claude Code is not installed. Install Claude Code, run `claude` (/login), then try again.")
 		}
-		return nil, Fail("not logged in. Run `claude`, use /login, then try again.")
+		if c.useKeychain(env) {
+			if _, _, lockedErr := c.readKeychain(env); lockedErr != nil {
+				return nil, Fail("not logged in to Claude Code (or macOS Keychain is locked). Unlock your Keychain or run `claude` (/login), then try again.")
+			}
+		}
+		return nil, Fail("not logged in to Claude Code. Run `claude`, use /login, then try again.")
 	}
 	uid := c.accountID(oauth, account)
 	if uid == "" {

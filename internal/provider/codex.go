@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
-	codexTokenURL = "https://auth.openai.com/oauth/token"
-	codexClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
+	codexUsageURL       = "https://chatgpt.com/backend-api/wham/usage"
+	codexTokenURL       = "https://auth.openai.com/oauth/token"
+	codexClientID       = "app_EMoamEEZ73f0CkXaXp7hrann"
+	codexKeyringService = "Codex Auth"
 )
 
 // Codex implements Provider for Codex CLI.
@@ -45,14 +46,98 @@ func (x *Codex) Compact(env *Env) (bool, error) {
 	return store.Compact(env.Root, x.Key(), x.SlotFile())
 }
 
+func (x *Codex) codexHome(env *Env) string {
+	if home := env.getenv("CODEX_HOME"); home != "" {
+		return home
+	}
+	return filepath.Join(env.Home, ".codex")
+}
+
 func (x *Codex) livePath(env *Env) string {
 	if v := env.getenv("TORI_CODEX_AUTH"); v != "" {
 		return v
 	}
-	if home := env.getenv("CODEX_HOME"); home != "" {
-		return filepath.Join(home, "auth.json")
+	return filepath.Join(x.codexHome(env), "auth.json")
+}
+
+// credStoreMode reads top-level `cli_auth_credentials_store` from $CODEX_HOME/config.toml.
+// Defaults to "file" when unset or unreadable.
+func (x *Codex) credStoreMode(env *Env) string {
+	if env.getenv("TORI_CODEX_AUTH") != "" {
+		return "file"
 	}
-	return filepath.Join(env.Home, ".codex", "auth.json")
+	raw, err := os.ReadFile(filepath.Join(x.codexHome(env), "config.toml"))
+	if err != nil {
+		return "file"
+	}
+	return parseCodexCredStoreMode(string(raw))
+}
+
+func parseCodexCredStoreMode(tomlText string) string {
+	for _, line := range strings.Split(tomlText, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			// Stop scanning once a [table] section starts; cli_auth_credentials_store is top-level.
+			break
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(key) != "cli_auth_credentials_store" {
+			continue
+		}
+		val = strings.TrimSpace(val)
+		if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') {
+			quote := val[0]
+			if end := strings.IndexByte(val[1:], quote); end >= 0 {
+				val = val[1 : 1+end]
+			}
+		} else if idx := strings.IndexByte(val, '#'); idx >= 0 {
+			val = strings.TrimSpace(val[:idx])
+		}
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "file", "keyring", "auto", "ephemeral":
+			return strings.ToLower(strings.TrimSpace(val))
+		}
+	}
+	return "file"
+}
+
+// keyringAccount matches openai/codex's compute_store_key: "cli|" + sha256(canonical_codex_home)[:16].
+func (x *Codex) keyringAccount(env *Env) string {
+	home := x.codexHome(env)
+	if abs, err := filepath.Abs(home); err == nil {
+		home = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(home); err == nil {
+		home = resolved
+	} else {
+		home = filepath.Clean(home)
+	}
+	sum := sha256.Sum256([]byte(home))
+	return "cli|" + hex.EncodeToString(sum[:])[:16]
+}
+
+func (x *Codex) readKeyring(env *Env) (map[string]any, string, error) {
+	if env.getenv("TORI_CODEX_AUTH") != "" || env.Keyring == nil {
+		return nil, "", nil
+	}
+	raw, err := env.Keyring.Get(codexKeyringService, x.keyringAccount(env))
+	if err != nil {
+		if isKeyringNotFound(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil || len(m) == 0 {
+		return nil, "", nil
+	}
+	return m, raw, nil
 }
 
 func (x *Codex) jwtPayload(token string) map[string]any {
@@ -104,11 +189,94 @@ func (x *Codex) identity(auth map[string]any) (acct, email, plan string) {
 }
 
 func (x *Codex) readLive(env *Env) map[string]any {
-	m := store.ReadJSONMap(x.livePath(env))
-	if len(m) == 0 {
+	if env.getenv("TORI_CODEX_AUTH") != "" {
+		m := store.ReadJSONMap(x.livePath(env))
+		if len(m) == 0 {
+			return nil
+		}
+		return m
+	}
+	mode := x.credStoreMode(env)
+	if mode == "keyring" || mode == "auto" {
+		if m, _, _ := x.readKeyring(env); len(m) > 0 {
+			return m
+		}
+		if m := store.ReadJSONMap(x.livePath(env)); len(m) > 0 {
+			return m
+		}
 		return nil
 	}
-	return m
+	if m := store.ReadJSONMap(x.livePath(env)); len(m) > 0 {
+		return m
+	}
+	if m, _, _ := x.readKeyring(env); len(m) > 0 {
+		return m
+	}
+	return nil
+}
+
+func (x *Codex) applyLive(env *Env, auth map[string]any) error {
+	if env.getenv("TORI_CODEX_AUTH") != "" {
+		return store.WriteJSONAtomic(x.livePath(env), auth, 0o600, false)
+	}
+	mode := x.credStoreMode(env)
+	acct := x.keyringAccount(env)
+	switch mode {
+	case "keyring":
+		if env.Keyring == nil {
+			return Fail("Codex is configured to use the OS keyring (`cli_auth_credentials_store = \"keyring\"`), but no keyring is available.")
+		}
+		raw, err := json.Marshal(auth)
+		if err != nil {
+			return err
+		}
+		if err := env.Keyring.Set(codexKeyringService, acct, string(raw)); err != nil {
+			return Failf("could not write Codex login to OS keyring: %v", err)
+		}
+		_ = os.Remove(x.livePath(env))
+		return nil
+	case "auto":
+		if env.Keyring != nil {
+			if raw, err := json.Marshal(auth); err == nil {
+				if err := env.Keyring.Set(codexKeyringService, acct, string(raw)); err == nil {
+					_ = os.Remove(x.livePath(env))
+					return nil
+				}
+			}
+		}
+		return store.WriteJSONAtomic(x.livePath(env), auth, 0o600, false)
+	default:
+		if err := store.WriteJSONAtomic(x.livePath(env), auth, 0o600, false); err != nil {
+			return err
+		}
+		// Keep any existing keyring entry in sync so switching doesn't leave stale credentials.
+		if env.Keyring != nil {
+			if existing, _, _ := x.readKeyring(env); len(existing) > 0 {
+				if raw, err := json.Marshal(auth); err == nil {
+					_ = env.Keyring.Set(codexKeyringService, acct, string(raw))
+				}
+			}
+		}
+		return nil
+	}
+}
+
+func (x *Codex) installed(env *Env) bool {
+	if env.LookPath != nil {
+		if _, err := env.LookPath("codex"); err == nil {
+			return true
+		}
+	}
+	if fileExists(x.livePath(env)) {
+		return true
+	}
+	if dirExists(x.codexHome(env)) {
+		return true
+	}
+	if m, _, _ := x.readKeyring(env); len(m) > 0 {
+		return true
+	}
+	return false
 }
 
 func (x *Codex) isKeySlot(m store.Meta) bool {
@@ -201,25 +369,53 @@ func (x *Codex) refreshCurrentSnapshot(env *Env, accts []store.Slot) {
 	}
 }
 
-// ClearLive stashes any active slot snapshot and removes local auth.json
+// ClearLive stashes any active slot snapshot and removes local auth.json / keyring entry
 // without revoking server-side OAuth tokens. The returned restore func undoes it.
 func (x *Codex) ClearLive(env *Env) (func() error, error) {
 	accts, _ := x.Slots(env)
 	x.refreshCurrentSnapshot(env, accts)
 
 	lp := x.livePath(env)
-	raw, err := os.ReadFile(lp)
-	if os.IsNotExist(err) {
+	rawFile, err := os.ReadFile(lp)
+	hasFile := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	var krAcct, krRaw string
+	if env.getenv("TORI_CODEX_AUTH") == "" && env.Keyring != nil {
+		if _, raw, _ := x.readKeyring(env); raw != "" {
+			krAcct = x.keyringAccount(env)
+			krRaw = raw
+		}
+	}
+
+	if !hasFile && krRaw == "" {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
+	if hasFile {
+		if err := os.Remove(lp); err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
 	}
-	if err := os.Remove(lp); err != nil && !os.IsNotExist(err) {
-		return nil, err
+	if krRaw != "" {
+		if err := env.Keyring.Delete(codexKeyringService, krAcct); err != nil {
+			return nil, err
+		}
 	}
+
 	restore := func() error {
-		return store.WriteBytesAtomic(lp, raw, 0o600, false)
+		if hasFile {
+			if err := store.WriteBytesAtomic(lp, rawFile, 0o600, false); err != nil {
+				return err
+			}
+		}
+		if krRaw != "" && env.Keyring != nil {
+			if err := env.Keyring.Set(codexKeyringService, krAcct, krRaw); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return restore, nil
 }
@@ -227,7 +423,22 @@ func (x *Codex) ClearLive(env *Env) (func() error, error) {
 func (x *Codex) Status(env *Env) (StatusInfo, error) {
 	live := x.readLive(env)
 	if live == nil {
-		return StatusInfo{LoggedIn: false, Message: "Not logged in to Codex."}, nil
+		if !x.installed(env) {
+			return StatusInfo{
+				LoggedIn: false,
+				Message:  "Codex is not installed. Install Codex CLI, run `codex login`, then `tori x add`.",
+			}, nil
+		}
+		if x.credStoreMode(env) == "ephemeral" {
+			return StatusInfo{
+				LoggedIn: false,
+				Message:  "Codex is configured with cli_auth_credentials_store = \"ephemeral\" (in-memory only), so no saved login is available.",
+			}, nil
+		}
+		return StatusInfo{
+			LoggedIn: false,
+			Message:  "Codex is installed, but not logged in. Run `codex login`, then `tori x add`.",
+		}, nil
 	}
 	accts, _ := x.Slots(env)
 	cur := x.Current(env, accts)
@@ -254,7 +465,13 @@ func (x *Codex) Status(env *Env) (StatusInfo, error) {
 func (x *Codex) Add(env *Env, args []string) ([]string, error) {
 	live := x.readLive(env)
 	if live == nil {
-		return nil, Fail("not logged in. Run `codex login`, then try again.")
+		if !x.installed(env) {
+			return nil, Fail("Codex is not installed. Install Codex CLI, run `codex login`, then try again.")
+		}
+		if x.credStoreMode(env) == "ephemeral" {
+			return nil, Fail("Codex is using cli_auth_credentials_store = \"ephemeral\" (in-memory only). Switch to \"file\" or \"keyring\" in config.toml, run `codex login`, then try again.")
+		}
+		return nil, Fail("not logged in to Codex. Run `codex login`, then try again.")
 	}
 	acct, email, plan := x.identity(live)
 	if acct == "" {
@@ -311,7 +528,7 @@ func (x *Codex) Activate(env *Env, slot store.Slot, accts []store.Slot, cur *int
 	if len(auth) == 0 {
 		return nil, Failf("slot %d is empty or corrupt; remove it and add it again.", slot.Number)
 	}
-	if err := store.WriteJSONAtomic(x.livePath(env), auth, 0o600, false); err != nil {
+	if err := x.applyLive(env, auth); err != nil {
 		return nil, err
 	}
 	return []string{"Restart codex to pick it up."}, nil

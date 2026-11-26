@@ -51,6 +51,7 @@ type dialogState struct {
 	status         provider.StatusInfo
 	initialSlot    *int // slot signed in when Add step 2 opened
 	stillSameLogin bool // true after a re-check finds the same saved account
+	notFound       bool // true after a re-check finds no live login
 	cursor         int  // index in current dialog choices
 	hoverIdx       int  // hovered choice index, -1 if none
 }
@@ -216,6 +217,14 @@ func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
 				lines = append(lines, m.theme.dim.Render("  "+ansi.Truncate(strings.Join(meta, " "+m.glyphs.sep+" "), innerW-2, m.glyphs.ellipsis)))
 			}
 			addWrappedPrefix("  ", "Sign in with a different one.", m.theme.dim)
+		} else if m.dlg.notFound {
+			lines = append(lines, "")
+			addWrappedPrefix(m.glyphs.warn+" ", "No login found yet.", m.theme.warn)
+			if msg := strings.TrimSpace(m.dlg.status.Message); msg != "" {
+				addWrappedPrefix("  ", msg, m.theme.dim)
+			} else {
+				addWrappedPrefix("  ", fmt.Sprintf("Sign in to %s and try again.", toolName), m.theme.dim)
+			}
 		}
 		hintLine = renderHint(m.glyphs.keyEnter, "check again", "esc", "cancel")
 
