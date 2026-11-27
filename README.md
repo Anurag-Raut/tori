@@ -65,7 +65,7 @@ go build -o tori .
 
 ## Quick start
 
-For Claude Code and Codex, save each account once; Tori handles switching from there. You can run `tori` and press `a` for the guided add flow, or save accounts from the CLI:
+Run `tori` and press `a` for the guided add flow. The picker is the main interface; every tool can also be managed from the CLI. For Claude Code and Codex, save each account once and Tori handles switching from there:
 
 ### Claude Code
 
@@ -91,6 +91,15 @@ Codex reads its login at startup, so restart `codex` after switching.
 
 Tori works with the **Antigravity CLI (`agy`)** only. Sign-in and sign-out happen in Google's own program; Tori saves account names and never copies or writes your logins.
 
+Everything is available in the picker:
+
+- **Add:** press `a`, choose Antigravity, name the account, and sign in with Google. If you're already signed in, choose to save only the name.
+- **Install:** if `agy` is missing, Tori shows Google's installer command and runs it when you confirm, then carries on.
+- **Switch:** select an account and press `Enter`.
+- **Sign in again or sign out:** press `Enter` on the account marked signed in.
+
+The same actions from the command line:
+
 ```bash
 tori g install            # run Google's official installer (asks first)
 tori g login work         # sign in with Google, save the account as "work"
@@ -106,7 +115,7 @@ tori g logout             # opens agy to run /logout; type /exit to come back
 
 #### Upgrading from 0.3.0 or earlier
 
-Antigravity Desktop, IDE, and T3 Code support has been removed. Your account names are kept, but the tokens older versions saved are no longer used. Delete them with:
+Antigravity Desktop, IDE, and T3 Code support has been removed. Your account names are kept, but the tokens older versions saved are no longer used. To delete them, press `x` in the picker, or run:
 
 ```bash
 tori g cleanup            # lists the files and asks first
@@ -137,13 +146,14 @@ Run `tori` with no arguments to open the interactive picker. Mouse navigation is
 | Key | Action |
 |---|---|
 | `↑` `↓` / `j` `k` / scroll | Move selection |
-| `Enter` / double-click | Switch to the selected account (or add on an empty tool) |
+| `Enter` / double-click | Switch to the selected account (or add on an empty tool). On the signed-in Antigravity account: sign in again or sign out |
 | `Tab` | Jump to the next tool |
 | `a` | Add or update an account |
 | `d` / `Delete` | Remove the selected account (with confirmation) |
 | `u` | Toggle usage meters for the selected tool |
 | `b` | Rotate Claude Code and Codex to their next account |
 | `r` | Refresh usage now |
+| `x` | Delete tokens saved by older versions (shown only when there are some) |
 | `?` | Show keybindings and bar legend |
 | `Esc` | Close active dialog |
 | `q` / `Ctrl+C` | Quit |

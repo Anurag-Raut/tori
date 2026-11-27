@@ -2,7 +2,9 @@ package tui
 
 import (
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -128,15 +130,182 @@ func TestRemoveSignInAccountOnlyForgetsName(t *testing.T) {
 	}
 }
 
-func TestOldTokenWarningOnStart(t *testing.T) {
+func TestAddCanOnlySaveName(t *testing.T) {
+	m, env, ran, _ := signInModel(t)
+	m, _ = m.openSignIn(&provider.Antigravity{})
+	// j and k are part of the name; only the arrows move between choices.
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("jk")})
+	m, _ = press(t, m, keyType(tea.KeyDown))
+	m, cmd := press(t, m, keyType(tea.KeyEnter))
+	m, _ = execCmd(m, cmd)
+	if len(*ran) != 0 {
+		t.Fatalf("saving a name must not run agy: %q", *ran)
+	}
+	got := agyAccounts(t, env)
+	if len(got) != 1 || got[0].Email != "jk" || !got[0].Active {
+		t.Fatalf("accounts = %+v", got)
+	}
+}
+
+func TestMissingAgyOffersInstallThenContinues(t *testing.T) {
+	m, env, ran, _ := signInModel(t)
+	bin := env.Getenv("TORI_AGY_BIN")
+	if err := os.Remove(bin); err != nil {
+		t.Fatal(err)
+	}
+	m.env.RunCommand = func(cmd *exec.Cmd) error {
+		*ran = append(*ran, cmd.Args)
+		return store.WriteBytesAtomic(bin, []byte("stub"), 0o700, false)
+	}
+
+	m, _ = m.openSignIn(&provider.Antigravity{})
+	if m.dlg.kind != dialogInstall || m.dlg.cursor != 0 {
+		t.Fatalf("expected the install question, kind=%v", m.dlg.kind)
+	}
+	m, _ = press(t, m, keyType(tea.KeyEsc))
+	if m.dlg.kind != dialogNone || len(*ran) != 0 {
+		t.Fatalf("esc must not install: ran=%q", *ran)
+	}
+
+	m, _ = m.openSignIn(&provider.Antigravity{})
+	m, cmd := press(t, m, keyType(tea.KeyEnter))
+	if cmd == nil {
+		t.Fatal("expected the installer to start")
+	}
+	next, _ := m.Update(cmd())
+	m = next.(Model)
+	if len(*ran) != 1 || !strings.Contains(strings.Join((*ran)[0], " "), "antigravity.google/cli/install.sh") {
+		t.Fatalf("ran %q", *ran)
+	}
+	if m.dlg.kind != dialogAddName {
+		t.Fatalf("expected the name prompt after installing, kind=%v", m.dlg.kind)
+	}
+}
+
+func TestFailedInstallWaitsAndStops(t *testing.T) {
+	m, env, _, runErr := signInModel(t)
+	if err := os.Remove(env.Getenv("TORI_AGY_BIN")); err != nil {
+		t.Fatal(err)
+	}
+	*runErr = errors.New("exit status 1")
+	var out strings.Builder
+	m.execTerminal = func(c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
+		c.SetStdin(strings.NewReader("\n"))
+		c.SetStdout(&out)
+		return func() tea.Msg { return fn(c.Run()) }
+	}
+	m, _ = m.openSignIn(&provider.Antigravity{})
+	m, cmd := press(t, m, keyType(tea.KeyEnter))
+	next, _ := m.Update(cmd())
+	m = next.(Model)
+	if !strings.Contains(out.String(), "Press Enter to return to Tori.") {
+		t.Fatalf("output = %q", out.String())
+	}
+	if m.dlg.kind != dialogNone || m.headerMsg.kind != msgError || !strings.Contains(m.headerMsg.text, "installer failed") {
+		t.Fatalf("kind=%v header=%+v", m.dlg.kind, m.headerMsg)
+	}
+}
+
+func TestSwitchWithoutAgyInstallsThenSignsIn(t *testing.T) {
+	m, env, ran, _ := signInModel(t, "work", "personal")
+	bin := env.Getenv("TORI_AGY_BIN")
+	if err := os.Remove(bin); err != nil {
+		t.Fatal(err)
+	}
+	m.env.RunCommand = func(cmd *exec.Cmd) error {
+		*ran = append(*ran, cmd.Args)
+		return store.WriteBytesAtomic(bin, []byte("stub"), 0o700, false)
+	}
+	m, _ = m.activateRow(agyRow(t, m, false))
+	if m.dlg.kind != dialogInstall {
+		t.Fatalf("expected the install question, kind=%v", m.dlg.kind)
+	}
+	m, cmd := press(t, m, keyType(tea.KeyEnter))
+	next, cmd := m.Update(cmd())
+	m, _ = execCmd(next.(Model), cmd)
+	if len(*ran) != 2 || strings.Join((*ran)[1][1:], " ") != "acp --login" {
+		t.Fatalf("ran %q", *ran)
+	}
+	for _, a := range agyAccounts(t, env) {
+		if a.Active != (a.Email == "work") {
+			t.Fatalf("expected work to be marked: %+v", a)
+		}
+	}
+}
+
+func TestSignedInAccountCanSignInAgainOrOut(t *testing.T) {
+	for _, tc := range []struct {
+		downs       int
+		args        string
+		stillActive bool
+	}{
+		{0, "acp --login", true},
+		{1, "-i /logout", false},
+	} {
+		m, env, ran, _ := signInModel(t, "work")
+		m, _ = m.activateRow(agyRow(t, m, true))
+		if m.dlg.kind != dialogAccount {
+			t.Fatalf("expected the account dialog, kind=%v", m.dlg.kind)
+		}
+		for range tc.downs {
+			m, _ = press(t, m, keyType(tea.KeyDown))
+		}
+		m, cmd := press(t, m, keyType(tea.KeyEnter))
+		m, _ = execCmd(m, cmd)
+		if len(*ran) != 1 || strings.Join((*ran)[0][1:], " ") != tc.args {
+			t.Fatalf("ran %q, want %q", *ran, tc.args)
+		}
+		if got := agyAccounts(t, env); got[0].Active != tc.stillActive {
+			t.Fatalf("after %q: %+v", tc.args, got)
+		}
+	}
+}
+
+func TestOldTokensCanBeDeletedFromPicker(t *testing.T) {
 	env, _ := setupTestEnv(t, nil)
 	env.DisableNetwork = true
-	dir := store.SlotDir(env.Root, "antigravity", 1)
-	if err := store.WriteJSONAtomic(dir+"/auth.json", map[string]any{"refreshToken": "rt"}, 0o600, false); err != nil {
+	token := filepath.Join(store.SlotDir(env.Root, "antigravity", 1), "auth.json")
+	if err := store.WriteJSONAtomic(token, map[string]any{"refreshToken": "rt"}, 0o600, false); err != nil {
 		t.Fatal(err)
 	}
 	m := NewModel(env)
-	if m.headerMsg.kind != msgWarning || !strings.Contains(m.headerMsg.text, "tori g cleanup") {
+	if m.headerMsg.kind != msgWarning || !strings.Contains(m.headerMsg.text, "press x") {
 		t.Fatalf("header = %+v", m.headerMsg)
 	}
+	if footer, _ := m.renderFooter(); !strings.Contains(footer, "old tokens") {
+		t.Fatalf("footer = %q", footer)
+	}
+	x := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")}
+
+	// Keeping is the default.
+	m, _ = press(t, m, x)
+	m, _ = press(t, m, keyType(tea.KeyEnter))
+	if _, err := os.Stat(token); err != nil || m.dlg.kind != dialogNone {
+		t.Fatalf("default choice must keep the file: %v", err)
+	}
+
+	m, _ = press(t, m, x)
+	m, _ = press(t, m, keyType(tea.KeyDown))
+	m, cmd := press(t, m, keyType(tea.KeyEnter))
+	m, _ = execCmd(m, cmd)
+	if _, err := os.Stat(token); !os.IsNotExist(err) {
+		t.Fatalf("token still there: %v", err)
+	}
+	if footer, _ := m.renderFooter(); strings.Contains(footer, "old tokens") {
+		t.Fatalf("footer = %q", footer)
+	}
+	if got := agyAccounts(t, env); len(got) != 1 {
+		t.Fatalf("the account name must stay: %+v", got)
+	}
+}
+
+func agyRow(t *testing.T, m Model, active bool) flatRow {
+	t.Helper()
+	for _, r := range m.rows() {
+		if r.provider.Key() == "antigravity" && r.account != nil && r.account.Active == active {
+			return r
+		}
+	}
+	t.Fatalf("no Antigravity row with active=%v", active)
+	return flatRow{}
 }

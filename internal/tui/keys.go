@@ -13,6 +13,7 @@ type keyMap struct {
 	Meters    key.Binding
 	Rotate    key.Binding
 	Refresh   key.Binding
+	Cleanup   key.Binding
 	Help      key.Binding
 	Back      key.Binding
 	Quit      key.Binding
@@ -60,6 +61,10 @@ func newKeyMap(g glyphs) keyMap {
 		Help: key.NewBinding(
 			key.WithKeys("?"),
 			key.WithHelp("?", "more"),
+		),
+		Cleanup: key.NewBinding(
+			key.WithKeys("x"),
+			key.WithHelp("x", "old tokens"),
 		),
 		Back: key.NewBinding(
 			key.WithKeys("esc"),

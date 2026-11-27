@@ -1,0 +1,19 @@
+ Tori
+
+                         +------------------------------------------------+                         
+                         |                                                |                         
+                         |  Delete old tokens?                            |                         
+                         |                                                |                         
+                         |  An older version of Tori saved these.         |                         
+                         |  They're no longer used. Account names are     |                         
+                         |  kept.                                         |                         
+                         |                                                |                         
+                         |    antigravity/accounts/1/auth.json            |                         
+                         |    antigravity/accounts/2/acp_token.json       |                         
+                         |                                                |                         
+                         |   Keep them                                    |                         
+                         |   Delete                                       |                         
+                         |                                                |                         
+                         |  enter choose - esc cancel                     |                         
+                         |                                                |                         
+                         +------------------------------------------------+                         

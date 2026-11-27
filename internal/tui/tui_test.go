@@ -871,12 +871,26 @@ func TestGoldenAllDialogs(t *testing.T) {
 		assertGolden(t, "dialog_add_name", m.View())
 	})
 
-	t.Run("dialog_add_not_installed", func(t *testing.T) {
+	t.Run("dialog_install", func(t *testing.T) {
 		m := buildFixtureModel(t, 100, 18)
-		m.dlg.kind = dialogAddName
-		m.dlg.provider = &provider.Antigravity{}
-		m.dlg.notInstalled = true
-		assertGolden(t, "dialog_add_not_installed", m.View())
+		m = m.openInstall(&provider.Antigravity{}, nil)
+		assertGolden(t, "dialog_install", m.View())
+	})
+
+	t.Run("dialog_agy_account", func(t *testing.T) {
+		m := buildFixtureModel(t, 100, 18)
+		m = m.openAccount(&provider.Antigravity{}, provider.AccountEntry{Number: 1, Email: "work", Active: true})
+		assertGolden(t, "dialog_agy_account", m.View())
+	})
+
+	t.Run("dialog_cleanup", func(t *testing.T) {
+		m := buildFixtureModel(t, 100, 18)
+		m.legacy["antigravity"] = []string{
+			filepath.Join(store.SlotDir(m.env.Root, "antigravity", 1), "auth.json"),
+			filepath.Join(store.SlotDir(m.env.Root, "antigravity", 2), "acp_token.json"),
+		}
+		m = m.openCleanup()
+		assertGolden(t, "dialog_cleanup", m.View())
 	})
 
 	t.Run("dialog_help", func(t *testing.T) {

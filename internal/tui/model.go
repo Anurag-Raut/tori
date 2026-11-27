@@ -143,6 +143,7 @@ type Model struct {
 
 	dlg        dialogState
 	aliasInput textinput.Model
+	legacy     map[string][]string // old token files by provider key
 
 	// execTerminal releases the screen to a command; tests replace it.
 	execTerminal func(tea.ExecCommand, tea.ExecCallback) tea.Cmd
@@ -206,6 +207,7 @@ func NewModel(env *provider.Env) Model {
 		data:       make(map[string][]provider.AccountEntry),
 		errors:     make(map[string]string),
 		usageOn:    make(map[string]bool),
+		legacy:     make(map[string][]string),
 		width:      100,
 		height:     24,
 		layout:     lay,
@@ -221,10 +223,8 @@ func NewModel(env *provider.Env) Model {
 	}
 	m.execTerminal = tea.Exec
 	m.loadLocalData()
-	for _, p := range m.providers {
-		if sp, ok := p.(provider.SignInProvider); ok && len(sp.LegacyTokenFiles(m.env)) > 0 {
-			m.setHeaderMsg(msgWarning, fmt.Sprintf("Old %s tokens on disk %s run tori %s cleanup", p.Title(), g.sep, p.Short()))
-		}
+	if p := m.legacyProvider(); p != nil {
+		m.setHeaderMsg(msgWarning, fmt.Sprintf("Old %s tokens on disk %s press x to delete", p.Title(), g.sep))
 	}
 	if m.anyUsageEnabled() && !m.env.DisableNetwork {
 		m.loading = true
@@ -255,6 +255,9 @@ func (m *Model) currentNow() time.Time {
 func (m *Model) loadLocalData() {
 	for _, p := range m.providers {
 		m.usageOn[p.Key()] = m.env.IsUsageEnabled(p.Key())
+		if sp, ok := p.(provider.SignInProvider); ok {
+			m.legacy[p.Key()] = sp.LegacyTokenFiles(m.env)
+		}
 		entries, _, err := provider.Entries(m.env, p, false, false)
 		if err != nil {
 			m.data[p.Key()] = nil
@@ -757,6 +760,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case addStatusMsg:
 		return m.handleAddStatus(msg)
 
+	case installDoneMsg:
+		return m.handleInstallDone(msg)
+
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 
@@ -933,6 +939,9 @@ func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Rotate):
 		return m, rotateAllCmd(m.env, m.providers)
 
+	case key.Matches(msg, m.keys.Cleanup):
+		return m.openCleanup(), nil
+
 	case key.Matches(msg, m.keys.Refresh):
 		// Reload any errored tools locally first.
 		m.loadLocalData()
@@ -963,6 +972,9 @@ func (m Model) activateRow(row flatRow) (Model, tea.Cmd) {
 		return m, nil
 	}
 	sp, signsIn := row.provider.(provider.SignInProvider)
+	if row.account != nil && signsIn && !sp.Installed(m.env) {
+		return m.openInstall(sp, func(m Model) (Model, tea.Cmd) { return m.activateRow(row) }), nil
+	}
 	if row.account == nil {
 		if signsIn {
 			return m.openSignIn(sp)
@@ -974,7 +986,7 @@ func (m Model) activateRow(row flatRow) (Model, tea.Cmd) {
 	}
 	if row.account.Active {
 		if signsIn {
-			return m, m.setHeaderMsg(msgInfo, "Marked signed in. Press a to sign in again")
+			return m.openAccount(sp, *row.account), nil
 		}
 		return m, m.setHeaderMsg(msgInfo, "Already active")
 	}
@@ -1119,6 +1131,43 @@ func (m Model) executeDialogChoice(id string) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.dlg.kind {
+	case dialogAddName:
+		return m.submitName(id)
+
+	case dialogInstall:
+		if p, ok := m.dlg.provider.(provider.SignInProvider); ok && id == "install" {
+			then := m.dlg.then
+			m.dlg.close()
+			return m, m.installCmd(p, then)
+		}
+
+	case dialogAccount:
+		p, ok := m.dlg.provider.(provider.SignInProvider)
+		if !ok || m.dlg.account == nil {
+			m.dlg.close()
+			return m, nil
+		}
+		acct := *m.dlg.account
+		m.dlg.close()
+		switch id {
+		case "signin":
+			return m, m.signInCmd(p, fmt.Sprintf("Signed in to %s", acct.Email), func(env *provider.Env) error {
+				_, err := p.Login(env, fmt.Sprintf("%d", acct.Number))
+				return err
+			})
+		case "signout":
+			return m, m.signInCmd(p, "agy closed. No account is marked signed in", func(env *provider.Env) error {
+				_, err := p.Logout(env)
+				return err
+			})
+		}
+
+	case dialogCleanup:
+		if p, ok := m.dlg.provider.(provider.SignInProvider); ok && id == "delete" {
+			m.dlg.close()
+			return m, deleteLegacyCmd(m.env, p)
+		}
+
 	case dialogAddPickTool:
 		if keyName, ok := strings.CutPrefix(id, "tool:"); ok {
 			for _, p := range m.providers {
@@ -1496,6 +1545,7 @@ func (m Model) renderFooter() (string, []footerHit) {
 	if m.layout.mode == layoutNarrow {
 		hints = narrowFooterHints(m.glyphs)
 	}
+	hints = m.adjustFooterHints(hints)
 	var parts []string
 	var hits []footerHit
 	x := 1
@@ -1516,6 +1566,26 @@ func (m Model) renderFooter() (string, []footerHit) {
 		x += w
 	}
 	return " " + strings.Join(parts, ""), hits
+}
+
+// adjustFooterHints fits the hints to the selected row and to old tokens.
+func (m Model) adjustFooterHints(hints []footerHint) []footerHint {
+	rows := m.rows()
+	if i := m.selectedIndex(rows); i >= 0 {
+		row := rows[i]
+		if _, signsIn := row.provider.(provider.SignInProvider); signsIn && row.account != nil && row.account.Active {
+			for j := range hints {
+				if hints[j].action == "enter" {
+					hints[j].desc = "manage"
+				}
+			}
+		}
+	}
+	if m.legacyProvider() != nil {
+		// First, so a narrow footer never cuts it off.
+		hints = append([]footerHint{{"x", "old tokens", "x"}}, hints...)
+	}
+	return hints
 }
 
 // View renders the entire TUI screen purely from model state (never calls time.Now()).

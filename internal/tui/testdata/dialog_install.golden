@@ -1,0 +1,20 @@
+ Tori
+
+                         +------------------------------------------------+                         
+                         |                                                |                         
+                         |  Install agy?                                  |                         
+                         |                                                |                         
+                         |  agy isn't installed. This runs Google's       |                         
+                         |  official installer, which may update your     |                         
+                         |  shell PATH:                                   |                         
+                         |                                                |                         
+                         |    curl -fsSL                                  |                         
+                         |    https://antigravity.google/cli/install.sh   |                         
+                         |    | bash                                      |                         
+                         |                                                |                         
+                         |   Install                                      |                         
+                         |   Cancel                                       |                         
+                         |                                                |                         
+                         |  enter choose - esc cancel                     |                         
+                         |                                                |                         
+                         +------------------------------------------------+                         
