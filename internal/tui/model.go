@@ -100,6 +100,7 @@ type actionDoneMsg struct {
 	text      string
 	refresh   bool
 	selectKey string
+	terminal  bool // the screen was released to an external command
 	now       time.Time
 }
 
@@ -142,6 +143,9 @@ type Model struct {
 
 	dlg        dialogState
 	aliasInput textinput.Model
+
+	// execTerminal releases the screen to a command; tests replace it.
+	execTerminal func(tea.ExecCommand, tea.ExecCallback) tea.Cmd
 
 	spinner spinner.Model
 	glyphs  glyphs
@@ -215,7 +219,13 @@ func NewModel(env *provider.Env) Model {
 		keys:       km,
 		noColor:    detectNoColor(&tuiEnv),
 	}
+	m.execTerminal = tea.Exec
 	m.loadLocalData()
+	for _, p := range m.providers {
+		if sp, ok := p.(provider.SignInProvider); ok && len(sp.LegacyTokenFiles(m.env)) > 0 {
+			m.setHeaderMsg(msgWarning, fmt.Sprintf("Old %s tokens on disk %s run tori %s cleanup", p.Title(), g.sep, p.Short()))
+		}
+	}
 	if m.anyUsageEnabled() && !m.env.DisableNetwork {
 		m.loading = true
 	}
@@ -600,10 +610,16 @@ func rotateAllCmd(env *provider.Env, providers []provider.Provider) tea.Cmd {
 			now = env.Now()
 		}
 		rotated := 0
+		skipped := ""
 		var failed []string
 		for _, p := range providers {
 			slots, _ := p.Slots(&e)
 			if len(slots) < 2 {
+				continue
+			}
+			if _, ok := p.(provider.SignInProvider); ok {
+				// Switching here is a sign-in the user asks for by account.
+				skipped = p.Title()
 				continue
 			}
 			rotated++
@@ -611,13 +627,20 @@ func rotateAllCmd(env *provider.Env, providers []provider.Provider) tea.Cmd {
 				failed = append(failed, fmt.Sprintf("%s: %s", p.Title(), err.Error()))
 			}
 		}
+		if rotated == 0 && skipped != "" {
+			return actionDoneMsg{ok: false, text: skipped + " needs a sign-in: select an account", now: now}
+		}
 		if rotated == 0 {
 			return actionDoneMsg{ok: false, text: "Need at least 2 accounts to rotate", now: now}
 		}
 		if len(failed) > 0 {
 			return actionDoneMsg{ok: false, text: strings.Join(failed, "; "), refresh: true, now: now}
 		}
-		return actionDoneMsg{ok: true, text: "Rotated all tools", refresh: true, now: now}
+		text := "Rotated all tools"
+		if skipped != "" {
+			text = "Rotated, except " + skipped + " (needs sign-in)"
+		}
+		return actionDoneMsg{ok: true, text: text, refresh: true, now: now}
 	}
 }
 
@@ -710,8 +733,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.reconcileSelection()
 			m.syncViewport()
 		}
+		// Releasing the screen turns mouse reporting off; turn it back on.
+		var mouse tea.Cmd
+		if msg.terminal {
+			mouse = tea.EnableMouseAllMotion
+		}
 		if msg.ok {
-			var cmds []tea.Cmd
+			cmds := []tea.Cmd{mouse}
 			if c := m.setHeaderMsg(msgSuccess, msg.text); c != nil {
 				cmds = append(cmds, c)
 			}
@@ -724,7 +752,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(cmds...)
 		}
-		return m, m.setHeaderMsg(msgError, msg.text)
+		return m, tea.Batch(mouse, m.setHeaderMsg(msgError, msg.text))
 
 	case addStatusMsg:
 		return m.handleAddStatus(msg)
@@ -755,6 +783,7 @@ func (m *Model) reconcileSelection() {
 func (m Model) handleAddStatus(msg addStatusMsg) (Model, tea.Cmd) {
 	st := msg.status
 	m.dlg.provider = msg.provider
+	m.aliasInput.Placeholder = "optional"
 	m.dlg.status = st
 	m.dlg.cursor = 0
 	m.dlg.hoverIdx = -1
@@ -933,14 +962,29 @@ func (m Model) activateRow(row flatRow) (Model, tea.Cmd) {
 		m.syncViewport()
 		return m, nil
 	}
+	sp, signsIn := row.provider.(provider.SignInProvider)
 	if row.account == nil {
+		if signsIn {
+			return m.openSignIn(sp)
+		}
 		// Empty tool -> jump directly to checking status for this tool.
 		m.dlg.close()
 		m.dlg.provider = row.provider
 		return m, checkAddStatusCmd(m.env, row.provider, false)
 	}
 	if row.account.Active {
+		if signsIn {
+			return m, m.setHeaderMsg(msgInfo, "Marked signed in. Press a to sign in again")
+		}
 		return m, m.setHeaderMsg(msgInfo, "Already active")
+	}
+	if signsIn {
+		// No optimistic update: the switch happens only if the sign-in succeeds.
+		num := row.account.Number
+		return m, m.signInCmd(sp, fmt.Sprintf("Switched to %s", row.account.Email), func(env *provider.Env) error {
+			_, err := provider.Switch(env, sp, fmt.Sprintf("%d", num))
+			return err
+		})
 	}
 
 	// Optimistic update: move active dot immediately; switchDoneMsg reconciles or rolls back.
@@ -981,13 +1025,13 @@ func (m Model) openRemoveDialog(p provider.Provider, acct provider.AccountEntry)
 
 	accts := m.data[p.Key()]
 	m.dlg.onlyAccount = len(accts) <= 1
-	if acct.Active && len(accts) > 1 {
+	if m.dlg.removingInUse() && len(accts) > 1 {
 		m.dlg.otherSlot = nextOtherSlot(accts, acct.Number)
 	}
 
 	// Safe default selection: never a destructive choice.
 	switch {
-	case !acct.Active:
+	case !m.dlg.removingInUse():
 		m.dlg.cursor = 0 // Cancel
 	case !m.dlg.onlyAccount && m.dlg.otherSlot > 0:
 		m.dlg.cursor = 0 // Switch to slot N, then remove
@@ -1024,6 +1068,9 @@ func (m Model) handleDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.dlg.close()
 		}
 		return m, nil
+
+	case dialogAddName:
+		return m.handleAddNameKey(msg)
 
 	case dialogAddSignIn:
 		if key.Matches(msg, m.keys.Switch) {
@@ -1076,6 +1123,9 @@ func (m Model) executeDialogChoice(id string) (tea.Model, tea.Cmd) {
 		if keyName, ok := strings.CutPrefix(id, "tool:"); ok {
 			for _, p := range m.providers {
 				if p.Key() == keyName {
+					if sp, ok := p.(provider.SignInProvider); ok {
+						return m.openSignIn(sp)
+					}
 					m.dlg.provider = p
 					return m, checkAddStatusCmd(m.env, p, false)
 				}

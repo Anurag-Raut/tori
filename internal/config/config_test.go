@@ -11,10 +11,13 @@ import (
 func TestUsageDefaultsAndSetUsage(t *testing.T) {
 	root := t.TempDir()
 
-	for _, k := range ToolKeys {
+	for _, k := range []string{"claude", "codex"} {
 		if !UsageEnabled(root, k) {
 			t.Fatalf("expected usage on by default for %s", k)
 		}
+	}
+	if UsageEnabled(root, "antigravity") {
+		t.Fatal("expected antigravity usage off by default")
 	}
 
 	if err := SetUsage(root, []string{"claude"}, false); err != nil {
@@ -31,8 +34,11 @@ func TestUsageDefaultsAndSetUsage(t *testing.T) {
 	if UsageEnabled(root, "claude") {
 		t.Fatal("expected claude usage disabled")
 	}
-	if !UsageEnabled(root, "codex") || !UsageEnabled(root, "antigravity") {
-		t.Fatal("expected codex and antigravity usage still on")
+	if !UsageEnabled(root, "codex") {
+		t.Fatal("expected codex usage still on")
+	}
+	if UsageEnabled(root, "antigravity") {
+		t.Fatal("changing another tool must not turn on antigravity usage")
 	}
 
 	if err := SetUsage(root, []string{"claude"}, true); err != nil {
@@ -40,6 +46,38 @@ func TestUsageDefaultsAndSetUsage(t *testing.T) {
 	}
 	if !UsageEnabled(root, "claude") {
 		t.Fatal("expected claude usage on after re-enabling")
+	}
+}
+
+func TestAntigravityUsageNeedsExplicitOptIn(t *testing.T) {
+	root := t.TempDir()
+
+	// Earlier releases wrote usage.antigravity = true without asking.
+	if err := os.WriteFile(Path(root), []byte(`{"usage":{"antigravity":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if UsageEnabled(root, "antigravity") {
+		t.Fatal("expected legacy antigravity usage=true to be ignored")
+	}
+
+	if err := SetUsage(root, []string{"antigravity"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if !UsageEnabled(root, "antigravity") {
+		t.Fatal("expected antigravity usage on after opting in")
+	}
+	if err := SetUsage(root, []string{"claude"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !UsageEnabled(root, "antigravity") {
+		t.Fatal("changing another tool must keep the antigravity opt-in")
+	}
+
+	if err := SetUsage(root, []string{"antigravity"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if UsageEnabled(root, "antigravity") {
+		t.Fatal("expected antigravity usage off after turning it off")
 	}
 }
 

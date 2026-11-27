@@ -111,14 +111,8 @@ func TestNoNetworkWhenUsageOff(t *testing.T) {
 		},
 	}, 0o600, false)
 
-	agyToken := filepath.Join(env.Home, "agy", "acp_token.json")
-	envMap["TORI_AGY_TOKEN"] = agyToken
-	_ = store.WriteJSONAtomic(agyToken, map[string]any{
-		"client_id":     "cid",
-		"client_secret": "csec",
-		"refresh_token": "rt-g1",
-		"project_id":    "proj-1",
-	}, 0o600, false)
+	// agy is installed; naming its account reads no login.
+	envMap["TORI_AGY_BIN"] = codexAuth
 
 	for _, p := range All() {
 		if _, err := p.Add(env, []string{"work"}); err != nil {
@@ -360,70 +354,6 @@ func TestCodexAPIKeyAndOAuthUsage(t *testing.T) {
 	}
 }
 
-func TestAntigravityEmailLearnAndQuotaFallback(t *testing.T) {
-	var summaryTried atomic.Int32
-	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		switch req.URL.String() {
-		case agyGoogleTokenURL:
-			return jsonResponse(200, map[string]any{"access_token": "agy-at", "expires_in": 3600}), nil
-		case agyUserinfoURL:
-			return jsonResponse(200, map[string]any{"email": "gemini@example.com"}), nil
-		case agyDailyEndpoint + "/v1internal:retrieveUserQuotaSummary":
-			summaryTried.Add(1)
-			return jsonResponse(200, map[string]any{}), nil // empty -> fall back
-		case agyProdEndpoint + "/v1internal:retrieveUserQuotaSummary":
-			return jsonResponse(500, map[string]any{"error": "boom"}), nil
-		case agyDailyEndpoint + "/v1internal:fetchAvailableModels":
-			return jsonResponse(200, map[string]any{
-				"models": map[string]any{
-					"gemini-2.5-pro": map[string]any{
-						"modelProvider":   "MODEL_PROVIDER_GOOGLE",
-						"quotaInfo":       map[string]any{"remainingFraction": 0.75, "resetTime": "2026-11-25T16:00:00Z"},
-						"weeklyQuotaInfo": map[string]any{"remainingFraction": 0.4, "resetTime": "2026-11-30T00:00:00Z"},
-					},
-				},
-			}), nil
-		default:
-			t.Fatalf("unexpected URL: %s", req.URL.String())
-			return nil, nil
-		}
-	})
-
-	env, envMap := newTestEnv(t, rt)
-	g := &Antigravity{}
-	tokPath := filepath.Join(env.Home, "agy", "acp_token.json")
-	envMap["TORI_AGY_TOKEN"] = tokPath
-	_ = store.WriteJSONAtomic(tokPath, map[string]any{
-		"client_id":     "cid",
-		"client_secret": "csec",
-		"refresh_token": "rt-g1",
-		"project_id":    "proj-1",
-	}, 0o600, false)
-
-	if _, err := g.Add(env, []string{"primary"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := config.SetUsage(env.Root, []string{"antigravity"}, true); err != nil {
-		t.Fatal(err)
-	}
-	entries, _, err := Entries(env, g, true, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if summaryTried.Load() == 0 {
-		t.Fatal("expected retrieveUserQuotaSummary on daily endpoint first")
-	}
-	if entries[0].Email != "gemini@example.com" {
-		t.Fatalf("expected learned email gemini@example.com, got %q", entries[0].Email)
-	}
-	if entries[0].Usage == nil || len(entries[0].Usage.Windows) != 2 {
-		t.Fatalf("unexpected usage: %+v", entries[0].Usage)
-	}
-	if entries[0].Usage.Windows[0].Pct != 25.0 || entries[0].Usage.Windows[1].Pct != 60.0 {
-		t.Fatalf("unexpected pct values: %+v", entries[0].Usage.Windows)
-	}
-}
-
 func TestOrderedProvidersEmptyLast(t *testing.T) {
 	all := All()
 	// Only Antigravity (index 2) and Codex (index 1) have accounts -> Codex, Antigravity, Claude.
@@ -447,8 +377,8 @@ func TestDefaultLabelDeduplicatesAliasMatchingName(t *testing.T) {
 	}
 }
 
-func TestClearLiveAndRestoreAllProviders(t *testing.T) {
-	env, envMap := newTestEnv(t, nil)
+func TestClearLiveAndRestoreClaudeCodex(t *testing.T) {
+	env, _ := newTestEnv(t, nil)
 
 	// --- Claude Code: preserves non-auth keys in both files ---
 	c := &Claude{}
@@ -514,28 +444,6 @@ func TestClearLiveAndRestoreAllProviders(t *testing.T) {
 	}
 	if st, _ := x.Status(env); !st.LoggedIn || st.DisplayName != "codex@example.com" {
 		t.Fatalf("expected codex restored, got %+v", st)
-	}
-
-	// --- Antigravity ---
-	g := &Antigravity{}
-	agyPath := filepath.Join(env.Home, "agy", "acp_token.json")
-	envMap["TORI_AGY_TOKEN"] = agyPath
-	_ = store.WriteJSONAtomic(agyPath, map[string]any{"refresh_token": "rt-g1"}, 0o600, false)
-	if _, err := g.Add(env, []string{"main"}); err != nil {
-		t.Fatal(err)
-	}
-	restoreG, err := g.ClearLive(env)
-	if err != nil {
-		t.Fatalf("antigravity ClearLive failed: %v", err)
-	}
-	if st, _ := g.Status(env); st.LoggedIn {
-		t.Fatal("expected antigravity logged out after ClearLive")
-	}
-	if err := restoreG(); err != nil {
-		t.Fatalf("antigravity restore failed: %v", err)
-	}
-	if st, _ := g.Status(env); !st.LoggedIn || st.ManagedSlot == nil || *st.ManagedSlot != 1 {
-		t.Fatalf("expected antigravity restored to slot 1, got %+v", st)
 	}
 }
 

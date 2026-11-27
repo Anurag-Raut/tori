@@ -9,6 +9,8 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -85,8 +87,13 @@ type Env struct {
 	Warn           func(string)
 	Environ        func(string) string
 	Keyring        KeyringStore
-	ProcessRunning func(surface string) bool
 	LookPath       func(name string) (string, error)
+
+	// Streams and runner for commands the user interacts with (sign-in, install).
+	Stdin      io.Reader
+	Stdout     io.Writer
+	Stderr     io.Writer
+	RunCommand func(cmd *exec.Cmd) error
 }
 
 // NewEnv constructs a default Env from process environment variables.
@@ -103,10 +110,34 @@ func NewEnv() *Env {
 		Warn: func(msg string) {
 			fmt.Fprintf(os.Stderr, "tori: %s\n", msg)
 		},
-		Environ:        os.Getenv,
-		Keyring:        osKeyring{},
-		ProcessRunning: isAntigravityProcessRunning,
-		LookPath:       defaultLookPath,
+		Environ:    os.Getenv,
+		Keyring:    osKeyring{},
+		LookPath:   exec.LookPath,
+		Stdin:      os.Stdin,
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
+		RunCommand: (*exec.Cmd).Run,
+	}
+}
+
+// runInteractive runs cmd attached to the user's terminal.
+func (e *Env) runInteractive(cmd *exec.Cmd) error {
+	if e.RunCommand == nil {
+		return Fail("can't run external commands here")
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = e.Stdin, e.Stdout, e.Stderr
+	// Ctrl+C belongs to the command: if Tori exited first, the command would be
+	// left reading the terminal. Notify (unlike Ignore) isn't inherited by it.
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+	return e.RunCommand(cmd)
+}
+
+// say prints guidance shown around an interactive command.
+func (e *Env) say(format string, args ...any) {
+	if e.Stdout != nil {
+		fmt.Fprintf(e.Stdout, format+"\n", args...)
 	}
 }
 
@@ -242,6 +273,32 @@ type Provider interface {
 	Fetch(env *Env, slot store.Slot, active bool, ctx any) ([]Window, error)
 }
 
+// SignInProvider switches accounts by running the tool's own sign-in. Tori saves
+// only account names for it and never copies or writes its logins.
+type SignInProvider interface {
+	Provider
+	Installed(env *Env) bool
+	InstallCommand(env *Env) string
+	Install(env *Env) ([]string, error)
+	Login(env *Env, name string) ([]string, error)
+	Logout(env *Env) ([]string, error)
+	LegacyTokenFiles(env *Env) []string
+	DeleteLegacyTokens(env *Env) (int, error)
+}
+
+// activeOnlyUsage is implemented by providers that can read quota only for the
+// signed-in account. Other accounts show their last cached reading.
+type activeOnlyUsage interface {
+	UsageActiveOnly() bool
+}
+
+// UsageError is a quota failure with its own user-facing label.
+type UsageError struct {
+	Text string
+}
+
+func (e *UsageError) Error() string { return e.Text }
+
 // All returns the canonical list of supported providers: Claude, Codex, Antigravity.
 func All() []Provider {
 	return []Provider{
@@ -347,6 +404,11 @@ func Switch(env *Env, p Provider, ref string) ([]string, error) {
 	if len(accts) == 0 {
 		return nil, Failf("no accounts saved yet (%s)", p.SetupHint())
 	}
+	_, signsIn := p.(SignInProvider)
+	if signsIn && ref == "" {
+		// Each switch is a sign-in the user asks for by account; never rotate.
+		return nil, Failf("choose the account to sign in to: tori %s switch <num|email|alias>", p.Short())
+	}
 	cur := p.Current(env, accts)
 	var target store.Slot
 	if ref != "" {
@@ -355,7 +417,11 @@ func Switch(env *Env, p Provider, ref string) ([]string, error) {
 			return nil, err
 		}
 		if cur != nil && target.Number == *cur {
-			return []string{fmt.Sprintf("Already on slot %d: %s", target.Number, p.Label(target.Number, target.Meta))}, nil
+			out := []string{fmt.Sprintf("Already on slot %d: %s", target.Number, p.Label(target.Number, target.Meta))}
+			if signsIn {
+				out = append(out, fmt.Sprintf("To sign in again: tori %s login %s", p.Short(), ref))
+			}
+			return out, nil
 		}
 	} else {
 		if len(accts) < 2 {
@@ -587,6 +653,9 @@ func UsageForSlot(env *Env, p Provider, slot store.Slot, active bool, ctx any, n
 	var cache UsageCache
 	_ = store.ReadJSON(usagePath, &cache)
 	prevFetched := cache.FetchedAt
+	if a, ok := p.(activeOnlyUsage); ok && a.UsageActiveOnly() && !active {
+		network = false
+	}
 	cache = p.Preload(env, slot, cache)
 	if cache.FetchedAt > prevFetched {
 		// Preload supplied fresher local data; clear any stale failure backoff.
@@ -634,7 +703,11 @@ func UsageForSlot(env *Env, p Provider, slot store.Slot, active bool, ctx any, n
 		} else {
 			rawErr := "offline"
 			var he *HTTPError
-			if errors.As(err, &he) {
+			var ue *UsageError
+			if errors.As(err, &ue) {
+				rawErr = ue.Text
+				errText = rawErr
+			} else if errors.As(err, &he) {
 				rawErr = HTTPStatusText(he.StatusCode)
 				if he.StatusCode == 429 && cache.FetchedAt > 0 && (now-cache.FetchedAt) < config.UsageTTL.Seconds()*2 {
 					errText = ""
@@ -993,4 +1066,14 @@ func maxSlotNumber(accts []store.Slot) int {
 	}
 	sort.SliceStable(accts, func(i, j int) bool { return accts[i].Number < accts[j].Number })
 	return maxN
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+func dirExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
 }

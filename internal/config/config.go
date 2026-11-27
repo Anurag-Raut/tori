@@ -39,14 +39,20 @@ const (
 // ToolKeys lists the canonical provider keys in display order.
 var ToolKeys = []string{"claude", "codex", "antigravity"}
 
+// optInTools have meters off until the user explicitly turns them on.
+var optInTools = map[string]bool{"antigravity": true}
+
 // DisclaimerTool maps provider keys with notable terms risks to a short warning.
 var DisclaimerTool = map[string]string{
-	"antigravity": "Antigravity: Google's terms prohibit third-party tools using Antigravity sign-in and may lead to account suspension.",
+	"antigravity": "Antigravity: Google's terms restrict third-party tools using Antigravity sign-in; your account may be suspended. Meters read the signed-in agy login.",
 }
 
 // Config represents ~/.tori/config.json.
 type Config struct {
 	Usage map[string]bool `json:"usage"`
+	// OptIn records explicit consent for optInTools. Usage alone is not enough
+	// for them, because earlier releases wrote usage.<key> = true without asking.
+	OptIn map[string]bool `json:"usageOptIn"`
 }
 
 // HomeDir resolves the user's home directory.
@@ -86,7 +92,7 @@ func Path(root string) string {
 }
 
 // Load reads config.json from root. Missing or corrupt config leaves Usage empty
-// so UsageEnabled falls back to the default (on).
+// so UsageEnabled falls back to the per-tool default.
 func Load(root string) Config {
 	var cfg Config
 	if !store.ReadJSON(Path(root), &cfg) {
@@ -98,9 +104,13 @@ func Load(root string) Config {
 	return cfg
 }
 
-// UsageEnabled returns true by default unless config.json explicitly sets usage.<key> = false.
+// UsageEnabled returns true by default unless config.json explicitly sets
+// usage.<key> = false. Opt-in tools are off unless usageOptIn.<key> = true.
 func UsageEnabled(root, key string) bool {
 	cfg := Load(root)
+	if optInTools[key] && !cfg.OptIn[key] {
+		return false
+	}
 	if enabled, ok := cfg.Usage[key]; ok {
 		return enabled
 	}
@@ -118,14 +128,24 @@ func SetUsage(root string, keys []string, enabled bool) error {
 		u = make(map[string]any)
 	}
 	for _, k := range ToolKeys {
-		if _, exists := u[k]; !exists {
+		if _, exists := u[k]; !exists && !optInTools[k] {
 			u[k] = true
 		}
 	}
+	optIn, ok := raw["usageOptIn"].(map[string]any)
+	if !ok || optIn == nil {
+		optIn = make(map[string]any)
+	}
 	for _, k := range keys {
 		u[k] = enabled
+		if optInTools[k] {
+			optIn[k] = enabled
+		}
 	}
 	raw["usage"] = u
+	if len(optIn) > 0 {
+		raw["usageOptIn"] = optIn
+	}
 	return store.WriteJSONAtomic(Path(root), raw, 0o600, false)
 }
 

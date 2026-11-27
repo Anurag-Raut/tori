@@ -20,10 +20,10 @@ const usageText = `usage: tori [command] [args]
 
   tori [--ascii]            interactive picker (enter switch, a add, d remove, u meters)
   tori list                 list accounts for every tool (--no-usage, --refresh, --json)
-  tori usage                show usage meters on/off per tool (on by default)
+  tori usage                show usage meters on/off per tool (Antigravity starts off)
   tori usage on|off <c|x|g|all> [--yes]   turn meters on (shows a disclaimer first) or off
   tori status               show the current account for each tool
-  tori switch               rotate every tool to its next account
+  tori switch               rotate Claude Code and Codex to their next account
   tori c|claude <sub>       Claude Code   (e.g. tori c switch 2)
   tori x|codex <sub>        Codex         (e.g. tori x switch 2)
   tori g|a|agy <sub>        Antigravity   (e.g. tori g switch work)
@@ -32,7 +32,13 @@ const usageText = `usage: tori [command] [args]
 
 Per tool: list, status, add [alias], switch [num|email|alias],
           remove <ref> [--yes], alias <ref> <name|--unset>, help
-  tori c add Work           tori x add Work         tori g remove 1`
+  tori c add Work           tori x add Work         tori g login Work
+
+Antigravity only (Google's own sign-in each time):
+  tori g install [--yes]    run Google's official agy installer
+  tori g login [name]       sign in, and save the account under name
+  tori g logout             open agy to sign out
+  tori g cleanup [--yes]    delete Antigravity tokens saved by older versions`
 
 // IO configures streams and TTY state for CLI execution.
 type IO struct {
@@ -71,6 +77,7 @@ func Run(env *provider.Env, args []string, version string, ioCfg IO, runTUI func
 	if ioCfg.Stdin == nil {
 		ioCfg.Stdin = os.Stdin
 	}
+	env.Stdin, env.Stdout, env.Stderr = ioCfg.Stdin, ioCfg.Stdout, ioCfg.Stderr
 	if env.Warn == nil {
 		env.Warn = func(msg string) {
 			fmt.Fprintf(ioCfg.Stderr, "tori: %s\n", msg)
@@ -141,6 +148,10 @@ func Run(env *provider.Env, args []string, version string, ioCfg IO, runTUI func
 			return 2
 		}
 		return forEach(env, ioCfg, func(p provider.Provider) error {
+			if _, ok := p.(provider.SignInProvider); ok {
+				fmt.Fprintf(ioCfg.Stdout, "Not rotated: switching needs a sign-in (tori %s switch <account>).\n", p.Short())
+				return nil
+			}
 			out, err := provider.Switch(env, p, "")
 			if err != nil {
 				return err
@@ -316,6 +327,11 @@ func cmdUsage(env *provider.Env, rest []string, ioCfg IO) int {
 }
 
 func cmdTopList(env *provider.Env, rest []string, ioCfg IO) int {
+	for _, p := range provider.All() {
+		if sp, ok := p.(provider.SignInProvider); ok {
+			noticeLegacyTokens(env, sp)
+		}
+	}
 	if hasFlag(rest, "--no-usage") {
 		cloned := *env
 		cloned.ForceUsageOff = true
@@ -358,6 +374,15 @@ func runProvider(env *provider.Env, p provider.Provider, argv []string, ioCfg IO
 
 	if sub != "help" && sub != "-h" && sub != "--help" {
 		_, _ = p.Compact(env)
+	}
+
+	if sp, ok := p.(provider.SignInProvider); ok {
+		if sub != "cleanup" {
+			noticeLegacyTokens(env, sp)
+		}
+		if handled, err := runSignIn(env, sp, sub, rest, ioCfg); handled {
+			return err
+		}
 	}
 
 	switch sub {
@@ -404,8 +429,12 @@ func runProvider(env *provider.Env, p provider.Provider, argv []string, ioCfg IO
 		if err != nil {
 			return err
 		}
-		ok, err := confirm(fmt.Sprintf("Remove slot %d: %s? This only forgets the saved login. [y/N] ",
-			slot.Number, p.Label(slot.Number, slot.Meta)), yes, ioCfg)
+		saved := "login"
+		if _, ok := p.(provider.SignInProvider); ok {
+			saved = "account name"
+		}
+		ok, err := confirm(fmt.Sprintf("Remove slot %d: %s? This only forgets the saved %s. [y/N] ",
+			slot.Number, p.Label(slot.Number, slot.Meta), saved), yes, ioCfg)
 		if err != nil {
 			return err
 		}
@@ -445,6 +474,101 @@ func runProvider(env *provider.Env, p provider.Provider, argv []string, ioCfg IO
 	default:
 		return provider.Failf("unknown command '%s' (try: tori %s help)", sub, p.Short())
 	}
+}
+
+// runSignIn handles the commands only sign-in providers have.
+func runSignIn(env *provider.Env, p provider.SignInProvider, sub string, rest []string, ioCfg IO) (bool, error) {
+	yes := hasFlag(rest, "-y", "--yes")
+	args := filterFlags(rest, "-y", "--yes")
+	var out []string
+	var err error
+
+	switch sub {
+	case "help", "-h", "--help":
+		out = []string{signInHelp(p)}
+	case "install":
+		if !p.Installed(env) {
+			fmt.Fprintf(ioCfg.Stdout, "This runs Google's official installer, which may update your shell PATH:\n  %s\n\n", p.InstallCommand(env))
+			ok, cerr := confirm("Run it? [y/N] ", yes, ioCfg)
+			if cerr != nil {
+				return true, cerr
+			}
+			if !ok {
+				fmt.Fprintln(ioCfg.Stdout, "Cancelled.")
+				return true, nil
+			}
+		}
+		out, err = p.Install(env)
+	case "login":
+		if len(args) > 1 {
+			return true, provider.Failf("usage: tori %s login [name]", p.Short())
+		}
+		name := ""
+		if len(args) == 1 {
+			name = args[0]
+		}
+		out, err = p.Login(env, name)
+	case "logout":
+		out, err = p.Logout(env)
+	case "cleanup":
+		files := p.LegacyTokenFiles(env)
+		if len(files) == 0 {
+			out = []string{"No saved tokens from older versions."}
+			break
+		}
+		fmt.Fprintln(ioCfg.Stdout, "Tokens saved by an older version of Tori:")
+		for _, f := range files {
+			fmt.Fprintf(ioCfg.Stdout, "  %s\n", f)
+		}
+		ok, cerr := confirm("Delete them? Account names are kept. [y/N] ", yes, ioCfg)
+		if cerr != nil {
+			return true, cerr
+		}
+		if !ok {
+			fmt.Fprintln(ioCfg.Stdout, "Cancelled.")
+			return true, nil
+		}
+		n, derr := p.DeleteLegacyTokens(env)
+		if derr != nil {
+			return true, derr
+		}
+		out = []string{fmt.Sprintf("Deleted %d token file(s).", n)}
+	default:
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	for _, line := range out {
+		fmt.Fprintln(ioCfg.Stdout, line)
+	}
+	return true, nil
+}
+
+func noticeLegacyTokens(env *provider.Env, p provider.SignInProvider) {
+	if len(p.LegacyTokenFiles(env)) > 0 {
+		env.Warn(fmt.Sprintf("%s tokens saved by an older version are still on disk and no longer used. Delete them with `tori %s cleanup`.", p.Title(), p.Short()))
+	}
+}
+
+func signInHelp(p provider.SignInProvider) string {
+	s := p.Short()
+	return fmt.Sprintf(`usage: tori %[1]s <command> [args]
+
+%[2]s
+
+  tori %[1]s install                  run Google's official agy installer (asks first)
+  tori %[1]s login [name]             sign in with Google, saving the account under name
+  tori %[1]s logout                   open agy to sign out
+  tori %[1]s add <name>               name the account agy is already signed in to
+  tori %[1]s switch <num|email|alias> sign in to a saved account
+  tori %[1]s list                     list accounts (* = last signed in through Tori)
+  tori %[1]s status                   show that account
+  tori %[1]s remove <num|email|alias> forget an account name (asks first; --yes skips)
+  tori %[1]s alias <ref> <name>       set a short name (--unset to clear)
+  tori %[1]s cleanup                  delete tokens saved by older versions (asks first)
+
+%[3]s`, s, p.HelpTitle(), p.SetupText())
 }
 
 func printProviderList(env *provider.Env, p provider.Provider, args []string, w io.Writer) error {

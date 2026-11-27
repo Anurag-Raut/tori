@@ -19,6 +19,7 @@ const (
 	dialogAddSignIn
 	dialogAddAlreadySaved
 	dialogAddSave
+	dialogAddName
 	dialogRemove
 	dialogMetersOn
 	dialogHelp
@@ -52,12 +53,23 @@ type dialogState struct {
 	initialSlot    *int // slot signed in when Add step 2 opened
 	stillSameLogin bool // true after a re-check finds the same saved account
 	notFound       bool // true after a re-check finds no live login
+	notInstalled   bool // the sign-in tool is missing
+	needName       bool // enter was pressed with an empty account name
 	cursor         int  // index in current dialog choices
 	hoverIdx       int  // hovered choice index, -1 if none
 }
 
 func (d *dialogState) close() {
 	*d = dialogState{hoverIdx: -1}
+}
+
+// removingInUse reports whether removing the account affects the live login.
+// Removing a sign-in provider's account only forgets its name.
+func (d dialogState) removingInUse() bool {
+	if _, ok := d.provider.(provider.SignInProvider); ok {
+		return false
+	}
+	return d.account != nil && d.account.Active
 }
 
 // dialogChoices returns the selectable choice list for the active dialog.
@@ -88,7 +100,7 @@ func (m Model) dialogChoices() []dialogChoice {
 		if m.dlg.account == nil {
 			return nil
 		}
-		if !m.dlg.account.Active {
+		if !m.dlg.removingInUse() {
 			// Not in use: Cancel is default (index 0).
 			return []dialogChoice{
 				{id: "cancel", label: "Cancel"},
@@ -270,13 +282,34 @@ func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
 		lines = append(lines, m.theme.dim.Render("Alias ")+m.aliasInput.View())
 		hintLine = renderHint(m.glyphs.keyEnter, "save", "esc", "cancel")
 
+	case dialogAddName:
+		toolName, short := "", ""
+		if m.dlg.provider != nil {
+			toolName, short = m.dlg.provider.Title(), m.dlg.provider.Short()
+		}
+		lines = append(lines, m.theme.dialogTitle.Render(fmt.Sprintf("Add %s account", toolName)))
+		lines = append(lines, "")
+		if m.dlg.notInstalled {
+			addWrappedPrefix(m.glyphs.warn+" ", "agy isn't installed.", m.theme.warn)
+			addWrappedPrefix("  ", fmt.Sprintf("Quit, run `tori %s install`, then add the account.", short), m.theme.dim)
+			hintLine = renderHint("esc", "close")
+			break
+		}
+		addWrapped("Name the account, then sign in with Google. Open the link agy prints and paste the code back.", m.theme.text)
+		lines = append(lines, "")
+		lines = append(lines, m.theme.dim.Render("Name  ")+m.aliasInput.View())
+		if m.dlg.needName {
+			addWrappedPrefix(m.glyphs.warn+" ", "Enter a name first.", m.theme.warn)
+		}
+		hintLine = renderHint(m.glyphs.keyEnter, "sign in", "esc", "cancel")
+
 	case dialogRemove:
 		if m.dlg.account == nil {
 			return "", nil, dialogRect{}
 		}
 		acct := *m.dlg.account
 		switch {
-		case !acct.Active:
+		case !m.dlg.removingInUse():
 			lines = append(lines, m.theme.dialogTitle.Render("Remove account?"))
 			lines = append(lines, "")
 			lines = append(lines, m.theme.text.Render(fitCell(acct.Email, innerW, false)))
