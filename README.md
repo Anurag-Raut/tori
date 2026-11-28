@@ -1,7 +1,8 @@
 <div align="center">
-  <img src="docs/tori.svg" alt="Tori" width="150">
-  <p><strong>Switch between Claude Code, Codex, and Antigravity accounts from your terminal — with live quota bars.</strong></p>
-  <p>Linux · macOS · Windows</p>
+  <img src="docs/tori.svg" alt="Tori logo" width="150">
+  <h1>Tori: account switcher for Claude Code, Codex CLI, and Antigravity CLI</h1>
+  <p><strong>Switch between multiple accounts from your terminal, with live quota bars for Claude Code and Codex.</strong></p>
+  <p>Linux · macOS · Windows. Independent open-source project, not affiliated with Anthropic, OpenAI, or Google.</p>
 
   <p>
     <a href="https://github.com/Anurag-Raut/tori/releases"><img src="https://img.shields.io/github/v/release/Anurag-Raut/tori?style=flat-square" alt="Release"></a>
@@ -10,13 +11,13 @@
     <a href="LICENSE"><img src="https://img.shields.io/github/license/Anurag-Raut/tori?style=flat-square" alt="License"></a>
   </p>
 
-  <img src="docs/screenshot.png" alt="Tori interactive terminal picker" width="820">
+  <img src="docs/screenshot.png" alt="Tori terminal UI listing Claude Code and Codex accounts with 5-hour and 7-day quota bars, and Antigravity CLI accounts with meters off" width="820">
 </div>
 
-## Highlights
+## Features
 
 - **Three tools, one picker** — manage multiple **Claude Code**, **Codex CLI**, and **Antigravity CLI** (`agy`) accounts side by side.
-- **Live quota and pace bars** — see remaining 5-hour and 7-day quota, reset timers, and whether you're ahead or behind pace for every saved Claude Code and Codex account. Antigravity meters are off until you turn them on, and cover only the signed-in account.
+- **Live quota and pace bars** — see remaining quota (such as 5-hour and 7-day windows), reset timers, and whether you're ahead or behind pace for saved Claude Code accounts and Codex ChatGPT sign-ins. Codex API keys have no quota to show. Antigravity meters are off until you turn them on, and cover only the signed-in account.
 - **No proxy, no daemon** — Tori swaps your own Claude Code and Codex logins (files and OS keyring entries) only when you ask it to, and switches Antigravity through Google's own sign-in. Your tools keep talking directly to their providers.
 - **Interactive TUI + scriptable CLI** — navigate with keyboard or mouse in the Bubble Tea picker, or automate workflows with subcommands and `--json`.
 - **Linux, macOS, and Windows** — a single static Go binary for x64 and arm64, with zero runtime dependencies.
@@ -24,6 +25,8 @@
 ## Install
 
 ### npm (Linux, macOS & Windows)
+
+The `tori-switch` package installs the `tori` command.
 
 ```bash
 npm install -g tori-switch
@@ -41,7 +44,7 @@ npx tori-switch
 curl -fsSL https://raw.githubusercontent.com/Anurag-Raut/tori/main/install.sh | sh
 ```
 
-Installs `tori` to `~/.local/bin` (override with `PREFIX=/usr/local/bin` or pin a version with `VERSION=v0.3.0`). Make sure `~/.local/bin` is on your `PATH`.
+Installs `tori` to `~/.local/bin` (override with `PREFIX=/usr/local/bin` or pin a version with `VERSION=v0.4.0`). Make sure `~/.local/bin` is on your `PATH`.
 
 ### Windows binary
 
@@ -131,7 +134,7 @@ tori g cleanup            # lists the files and asks first
 
 > **macOS Keychain note:** On macOS, the first time `claude` or `codex` reads a Keychain item written by Tori, or Tori reads `agy`'s item for quota, macOS may show a one-time "Allow access" prompt.
 
-## Reading the quota bars
+## Quota bars and pace indicators
 
 - **Fill = quota remaining** — neutral slate-blue when healthy, amber (`!`) at 20% left or under, and red (`✕`) at 0%.
 - **Pace line (`│`) = time left until reset** — fill past `│` means quota to spare; fill short of `│` means you're burning faster than the window resets.
@@ -139,7 +142,7 @@ tori g cleanup            # lists the files and asks first
 - **Caching & backoff** — readings are cached locally for 3 minutes, refreshes are deduplicated and rate-limited, and transient errors or HTTP 429 responses back off automatically while keeping your last known numbers.
 - **Per-tool control** — toggle quota meters off for any tool with `u` in the picker or `tori usage off <c|x|g|all>` for zero network requests.
 
-## Interactive picker
+## Interactive terminal UI (TUI)
 
 Run `tori` with no arguments to open the interactive picker. Mouse navigation is supported throughout (hover rows, click to select, double-click to switch, click footer hints or dialog choices).
 
@@ -180,11 +183,11 @@ tori g remove 2          # forget a saved account (--yes skips prompt)
 tori c list --json       # machine-readable JSON output
 ```
 
-Every tool supports `list` (`ls`), `status`, `add [alias]`, `switch` (`sw`), `remove` (`rm`), `alias`, and `help`. Antigravity requires a name for `add` and `switch`, and also has `install`, `login`, `logout`, and `cleanup`.
+Every tool supports `list` (`ls`), `status`, `add [alias]`, `switch` (`sw`), `remove` (`rm`), `alias`, and `help`. Antigravity requires a name for `add` and an account (slot number, email, or alias) for `switch`, and also has `install`, `login`, `logout`, and `cleanup`.
 
 ## Configuration & environment
 
-Preferences live in `~/.tori/config.json` and saved credentials under `~/.tori/{claude,codex}`. `~/.tori/antigravity` holds account names and cached quota only. On Windows, `~` is your user profile (`%USERPROFILE%`).
+Preferences live in `~/.tori/config.json` and saved credentials under `~/.tori/{claude,codex}`. `~/.tori/antigravity` holds account names and cached quota; token files saved by 0.3.0 or earlier stay there until you delete them. On Windows, `~` is your user profile (`%USERPROFILE%`).
 
 | Variable | Description |
 |---|---|
@@ -200,8 +203,26 @@ Preferences live in `~/.tori/config.json` and saved credentials under `~/.tori/{
 ## Privacy & terms
 
 - **Local only** — saved logins stay on your machine under `~/.tori/`, written atomically. Files are created with `0600` permissions on Linux and macOS; on Windows they inherit your folder's permissions. Never share that folder.
-- **Direct connections** — Tori is not a proxy and runs no background service. When quota meters are enabled, requests go directly to Anthropic, OpenAI, and Google to read usage (and refresh expired Claude Code and Codex tokens when needed). Turning meters off (`tori usage off all` or `--no-usage`) stops Tori's own network traffic; Claude Code and Codex switching works offline. Antigravity sign-in and installation need a connection.
+- **Direct connections** — Tori is not a proxy and runs no background service. When quota meters are enabled, requests go directly to Anthropic, OpenAI, and Google to read usage (and refresh expired tokens of saved Claude Code and Codex accounts that aren't in use). Turning meters off (`tori usage off all` or `--no-usage`) stops Tori's own network traffic; Claude Code and Codex switching works offline. Antigravity sign-in and installation need a connection.
 - **Antigravity note** — Google's [terms](https://antigravity.google/terms) and [FAQ](https://antigravity.google/docs/faq) restrict third-party tools, including wrapping `agy` and automating account switching, and accounts may be suspended. Using Google's own sign-in lowers that risk but is not approval from Google. Quota meters read your `agy` login and call Google's quota endpoints as an Antigravity client, so they are off by default; turn them on with `tori usage on g` (or `u` in the picker) only if you accept that risk.
+
+## FAQ
+
+### How do I switch between multiple Claude Code or Codex accounts?
+
+Sign in with `claude` or `codex login`, save the account in Tori, and repeat for the next account. Then pick one in `tori`, or run `tori c switch <account>` or `tori x switch <account>`.
+
+### Does Tori support Gemini CLI or the Antigravity IDE?
+
+No. For Google accounts Tori supports the Antigravity CLI (`agy`) only. Antigravity Desktop, the IDE, T3 Code, and Gemini CLI are not supported. `tori gemini` is only a command alias for Antigravity.
+
+### How does Antigravity account switching work?
+
+Each switch is a new Google sign-in in `agy`. Tori doesn't rotate Antigravity accounts, and its quota meters are off by default.
+
+### Is Tori made by Anthropic, OpenAI, or Google?
+
+No. Tori is an independent, MIT-licensed project.
 
 ## Development
 
