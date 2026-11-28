@@ -37,8 +37,10 @@ Per tool: list, status, add [alias], switch [num|email|alias],
 Antigravity only (Google's own sign-in each time):
   tori g install [--yes]    run Google's official agy installer
   tori g login [name]       sign in, and save the account under name
-  tori g logout             open agy to sign out
-  tori g cleanup [--yes]    delete Antigravity tokens saved by older versions`
+  tori g logout             sign out (agy opens for /logout; T3 Code signs out itself)
+  tori g cleanup [--yes]    delete Antigravity tokens saved by older versions
+  Targets: --agy (CLI and App), --t3 (all T3 Code instances), --t3=<instance>.
+  Without a flag Tori uses your last choice, or every installed target.`
 
 // IO configures streams and TTY state for CLI execution.
 type IO struct {
@@ -68,6 +70,12 @@ func Execute(args []string, version string) int {
 
 // Run executes the CLI using the provided Env, IO, and TUI launcher.
 func Run(env *provider.Env, args []string, version string, ioCfg IO, runTUI func(*provider.Env) int) int {
+	if len(args) == 2 && args[0] == openURLCommand {
+		return cmdOpenURL(args[1], ioCfg)
+	}
+	if version != "" {
+		provider.Version = version
+	}
 	if ioCfg.Stdout == nil {
 		ioCfg.Stdout = os.Stdout
 	}
@@ -372,6 +380,22 @@ func runProvider(env *provider.Env, p provider.Provider, argv []string, ioCfg IO
 	}
 	sub, rest := argv[0], argv[1:]
 
+	if tp, ok := p.(provider.TargetedProvider); ok {
+		var ids []string
+		rest, ids = parseTargetFlags(rest)
+		if len(ids) > 0 {
+			cloned := *env
+			cloned.Targets = ids
+			env = &cloned
+		}
+		if sub == "login" || sub == "switch" || sub == "sw" {
+			var err error
+			if env, err = offerInstall(env, tp, rest, ioCfg); err != nil {
+				return err
+			}
+		}
+	}
+
 	if sub != "help" && sub != "-h" && sub != "--help" {
 		_, _ = p.Compact(env)
 	}
@@ -559,14 +583,20 @@ func signInHelp(p provider.SignInProvider) string {
 
   tori %[1]s install                  run Google's official agy installer (asks first)
   tori %[1]s login [name]             sign in with Google, saving the account under name
-  tori %[1]s logout                   open agy to sign out
+  tori %[1]s logout                   sign out (agy opens for /logout; T3 Code signs out itself)
   tori %[1]s add <name>               name the account agy is already signed in to
   tori %[1]s switch <num|email|alias> sign in to a saved account
   tori %[1]s list                     list accounts (* = last signed in through Tori)
-  tori %[1]s status                   show that account
+  tori %[1]s status                   show that account and where it is signed in
   tori %[1]s remove <num|email|alias> forget an account name (asks first; --yes skips)
   tori %[1]s alias <ref> <name>       set a short name (--unset to clear)
   tori %[1]s cleanup                  delete tokens saved by older versions (asks first)
+
+Targets for login, logout and switch:
+  --agy        the agy CLI and the Antigravity App (they share one sign-in)
+  --t3         every T3 Code Antigravity instance
+  --t3=<name>  one T3 Code instance
+Without a flag Tori uses your last choice, or every installed target.
 
 %[3]s`, s, p.HelpTitle(), p.SetupText())
 }
@@ -613,6 +643,9 @@ func printProviderList(env *provider.Env, p provider.Provider, args []string, w 
 		}
 		var meta = accts[i].Meta
 		left := fmt.Sprintf(" %s %d: %s", mark, e.Number, p.Label(e.Number, meta))
+		if len(e.SignedIn) > 0 {
+			left += "  (" + strings.Join(e.SignedIn, ", ") + ")"
+		}
 		line := provider.UsageLine(e.Usage, e.Note)
 		lefts[i] = left
 		lines[i] = line

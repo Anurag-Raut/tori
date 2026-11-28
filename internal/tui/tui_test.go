@@ -877,6 +877,19 @@ func TestGoldenAllDialogs(t *testing.T) {
 		assertGolden(t, "dialog_install", m.View())
 	})
 
+	t.Run("dialog_targets", func(t *testing.T) {
+		m := buildFixtureModel(t, 100, 18)
+		m.dlg.kind = dialogTargets
+		m.dlg.provider = &provider.Antigravity{}
+		m.dlg.title = "Switch Antigravity to work@example.com"
+		m.dlg.targets = []provider.Target{
+			{ID: "agy", Label: "Antigravity CLI & App (agy)", Name: "Antigravity CLI & App", Note: "(agy)"},
+			{ID: "t3:antigravity", Label: "T3 Code", Name: "T3 Code", Note: "restart or start a new chat after"},
+		}
+		m.dlg.checked = []bool{true, false}
+		assertGolden(t, "dialog_targets", m.View())
+	})
+
 	t.Run("dialog_agy_account", func(t *testing.T) {
 		m := buildFixtureModel(t, 100, 18)
 		m = m.openAccount(&provider.Antigravity{}, provider.AccountEntry{Number: 1, Email: "work", Active: true})

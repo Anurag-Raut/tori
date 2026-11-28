@@ -5,8 +5,9 @@
                          |  work                                          |                         
                          |  Slot 1 - marked signed in                     |                         
                          |                                                |                         
-                         |  Sign out opens agy. Type /logout if you're    |                         
-                         |  still signed in, then /exit to come back.     |                         
+                         |  Sign out opens agy (type /logout if you're    |                         
+                         |  still signed in, then /exit). T3 Code signs   |                         
+                         |  out by itself.                                |                         
                          |                                                |                         
                          |   Sign in again                                |                         
                          |   Sign out                                     |                         
@@ -15,4 +16,3 @@
                          |  enter choose - esc cancel                     |                         
                          |                                                |                         
                          +------------------------------------------------+                         
-                                                                                                    

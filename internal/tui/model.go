@@ -993,9 +993,13 @@ func (m Model) activateRow(row flatRow) (Model, tea.Cmd) {
 	if signsIn {
 		// No optimistic update: the switch happens only if the sign-in succeeds.
 		num := row.account.Number
-		return m, m.signInCmd(sp, fmt.Sprintf("Switched to %s", row.account.Email), func(env *provider.Env) error {
-			_, err := provider.Switch(env, sp, fmt.Sprintf("%d", num))
-			return err
+		email := row.account.Email
+		return m.withTargets(sp, "Switch Antigravity to "+email, func(m Model, ids []string) (Model, tea.Cmd) {
+			return m, m.signInCmd(sp, fmt.Sprintf("Switched to %s", email), func(env *provider.Env) error {
+				env.Targets = ids
+				_, err := provider.Switch(env, sp, fmt.Sprintf("%d", num))
+				return err
+			})
 		})
 	}
 
@@ -1084,6 +1088,9 @@ func (m Model) handleDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case dialogAddName:
 		return m.handleAddNameKey(msg)
 
+	case dialogTargets:
+		return m.handleTargetsKey(msg)
+
 	case dialogAddSignIn:
 		if key.Matches(msg, m.keys.Switch) {
 			return m, checkAddStatusCmd(m.env, m.dlg.provider, true)
@@ -1131,6 +1138,17 @@ func (m Model) executeDialogChoice(id string) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.dlg.kind {
+	case dialogTargets:
+		if tid, ok := strings.CutPrefix(id, "target:"); ok {
+			for i, t := range m.dlg.targets {
+				if t.ID == tid {
+					m.dlg.cursor = i
+					return m.toggleTarget(), nil
+				}
+			}
+		}
+		return m, nil
+
 	case dialogAddName:
 		return m.submitName(id)
 
@@ -1151,14 +1169,20 @@ func (m Model) executeDialogChoice(id string) (tea.Model, tea.Cmd) {
 		m.dlg.close()
 		switch id {
 		case "signin":
-			return m, m.signInCmd(p, fmt.Sprintf("Signed in to %s", acct.Email), func(env *provider.Env) error {
-				_, err := p.Login(env, fmt.Sprintf("%d", acct.Number))
-				return err
+			return m.withTargets(p, "Sign in Antigravity as "+acct.Email, func(m Model, ids []string) (Model, tea.Cmd) {
+				return m, m.signInCmd(p, fmt.Sprintf("Signed in to %s", acct.Email), func(env *provider.Env) error {
+					env.Targets = ids
+					_, err := p.Login(env, fmt.Sprintf("%d", acct.Number))
+					return err
+				})
 			})
 		case "signout":
-			return m, m.signInCmd(p, "agy closed. No account is marked signed in", func(env *provider.Env) error {
-				_, err := p.Logout(env)
-				return err
+			return m.withTargets(p, "Sign out of Antigravity", func(m Model, ids []string) (Model, tea.Cmd) {
+				return m, m.signInCmd(p, "Signed out. No account is marked signed in there", func(env *provider.Env) error {
+					env.Targets = ids
+					_, err := p.Logout(env)
+					return err
+				})
 			})
 		}
 

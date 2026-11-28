@@ -349,3 +349,92 @@ func TestAntigravitySignInCommands(t *testing.T) {
 		t.Fatalf("claude login: rc=%d err=%q", rc, errOut)
 	}
 }
+
+func TestParseTargetFlags(t *testing.T) {
+	rest, ids := parseTargetFlags([]string{"work", "--t3", "--agy", "--t3=Main", "--t3=", "-y"})
+	if strings.Join(rest, ",") != "work,-y" {
+		t.Fatalf("rest = %v", rest)
+	}
+	if want := "t3:*,agy,t3:Main,t3:*"; strings.Join(ids, ",") != want {
+		t.Fatalf("ids = %v, want %s", ids, want)
+	}
+	if _, ids := parseTargetFlags([]string{"work"}); len(ids) != 0 {
+		t.Fatalf("ids = %v", ids)
+	}
+}
+
+func TestOpenerCommands(t *testing.T) {
+	for goos, want := range map[string]string{
+		"linux":   "xdg-open U",
+		"darwin":  "open U",
+		"windows": "rundll32 url.dll,FileProtocolHandler U",
+	} {
+		name, args := openerFor(goos, "U")
+		if got := name + " " + strings.Join(args, " "); got != want {
+			t.Fatalf("%s: %q, want %q", goos, got, want)
+		}
+	}
+}
+
+func TestOpenURLRefusesOtherLinks(t *testing.T) {
+	env, _ := setupCLIEnv(t, nil)
+	rc, _, errOut := runCmd(env, "", false, openURLCommand, "https://evil.example/o/oauth2/v2/auth")
+	if rc != 1 || !strings.Contains(errOut, "refusing") {
+		t.Fatalf("rc=%d err=%q", rc, errOut)
+	}
+}
+
+func TestTargetFlagsAndInstallOffer(t *testing.T) {
+	env, envMap := setupCLIEnv(t, nil)
+	envMap["T3CODE_HOME"] = filepath.Join(t.TempDir(), "t3")
+
+	// No terminal and nothing installed: the error names both ways.
+	rc, _, errOut := runCmd(env, "", false, "g", "login", "work")
+	if rc != 1 || !strings.Contains(errOut, "tori g install") || !strings.Contains(errOut, "T3 Code") {
+		t.Fatalf("rc=%d err=%q", rc, errOut)
+	}
+	// On a terminal, answering no stops there and installs nothing.
+	var ran [][]string
+	env.RunCommand = func(cmd *exec.Cmd) error {
+		ran = append(ran, cmd.Args)
+		return nil
+	}
+	rc, out, errOut := runCmd(env, "n\n", true, "g", "login", "work")
+	if rc != 1 || len(ran) != 0 || !strings.Contains(out, "Install agy now? [y/N]") || !strings.Contains(out, "Tori never installs T3 Code") {
+		t.Fatalf("rc=%d ran=%v out=%q err=%q", rc, ran, out, errOut)
+	}
+	// Yes runs Google's installer, then the sign-in starts.
+	bin := filepath.Join(env.Home, ".local", "bin", "agy")
+	env.RunCommand = func(cmd *exec.Cmd) error {
+		ran = append(ran, cmd.Args)
+		if len(ran) == 1 {
+			return store.WriteBytesAtomic(bin, []byte("stub"), 0o700, false)
+		}
+		return nil
+	}
+	rc, out, errOut = runCmd(env, "y\n", true, "g", "login", "work")
+	if rc != 0 || len(ran) != 2 || ran[0][0] != "bash" || ran[1][len(ran[1])-2] != "acp" || ran[1][len(ran[1])-1] != "--login" {
+		t.Fatalf("rc=%d ran=%v out=%q err=%q", rc, ran, out, errOut)
+	}
+	// --t3 with only agy installed is a clear error.
+	rc, _, errOut = runCmd(env, "", false, "g", "login", "x", "--t3")
+	if rc != 1 || !strings.Contains(errOut, "T3 Code isn't ready") {
+		t.Fatalf("rc=%d err=%q", rc, errOut)
+	}
+	// --agy is remembered; list and status show where the account is signed in.
+	rc, _, errOut = runCmd(env, "", false, "g", "login", "work", "--agy")
+	if rc != 0 {
+		t.Fatalf("rc=%d err=%q", rc, errOut)
+	}
+	if got := config.AntigravityTargets(env.Root); len(got) != 1 || got[0] != "agy" {
+		t.Fatalf("remembered = %v", got)
+	}
+	_, out, _ = runCmd(env, "", false, "g", "list", "--no-usage")
+	if !strings.Contains(out, "(agy)") {
+		t.Fatalf("list = %q", out)
+	}
+	_, out, _ = runCmd(env, "", false, "g", "status")
+	if !strings.Contains(out, "on agy") {
+		t.Fatalf("status = %q", out)
+	}
+}

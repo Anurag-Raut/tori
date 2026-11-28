@@ -53,6 +53,8 @@ type Config struct {
 	// OptIn records explicit consent for optInTools. Usage alone is not enough
 	// for them, because earlier releases wrote usage.<key> = true without asking.
 	OptIn map[string]bool `json:"usageOptIn"`
+	// AntigravityTargets is the last choice of Antigravity targets to switch.
+	AntigravityTargets []string `json:"antigravityTargets,omitempty"`
 }
 
 // HomeDir resolves the user's home directory.
@@ -160,4 +162,19 @@ func DisclaimerLines(keys []string) []string {
 	}
 	lines = append(lines, DisclaimerTail)
 	return lines
+}
+
+// AntigravityTargets returns the remembered Antigravity targets, or nil.
+func AntigravityTargets(root string) []string {
+	return Load(root).AntigravityTargets
+}
+
+// SetAntigravityTargets remembers the chosen Antigravity targets in config.json.
+func SetAntigravityTargets(root string, ids []string) error {
+	raw := store.ReadJSONMap(Path(root))
+	if raw == nil {
+		raw = make(map[string]any)
+	}
+	raw["antigravityTargets"] = ids
+	return store.WriteJSONAtomic(Path(root), raw, 0o600, false)
 }
