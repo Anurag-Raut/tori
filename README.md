@@ -16,7 +16,7 @@
 
 ## Features
 
-- **Three tools, one picker** — manage multiple **Claude Code**, **Codex CLI**, and **Antigravity CLI** (`agy`) accounts side by side.
+- **Three tools, one picker** — manage multiple **Claude Code**, **Codex CLI**, and **Antigravity** (`agy` and T3 Code) accounts side by side.
 - **Live quota and pace bars** — see remaining quota (such as 5-hour and 7-day windows), reset timers, and whether you're ahead or behind pace for saved Claude Code accounts and Codex ChatGPT sign-ins. Codex API keys have no quota to show. Antigravity meters are off until you turn them on, and cover only the signed-in account.
 - **No proxy, no daemon** — Tori swaps your own Claude Code and Codex logins (files and OS keyring entries) only when you ask it to, and switches Antigravity through Google's own sign-in. Your tools keep talking directly to their providers.
 - **Interactive TUI + scriptable CLI** — navigate with keyboard or mouse in the Bubble Tea picker, or automate workflows with subcommands and `--json`.
@@ -92,14 +92,21 @@ Codex reads its login at startup, so restart `codex` after switching.
 
 ### Antigravity
 
-Tori works with the **Antigravity CLI (`agy`)** only. Sign-in and sign-out happen in Google's own program; Tori saves account names and never copies or writes your logins.
+Tori switches Antigravity in two places, which it calls targets:
+
+- **Antigravity CLI and App (`agy`).** Google's docs say the Antigravity App (desktop 2.x) shares `agy`'s sign-in, so one target covers both.
+- **T3 Code.** T3 Code runs its own copy of Google's Antigravity runtime. Tori starts that copy the same way T3 Code does and lets Google's code do the sign-in. Tori never installs or downloads it: install Antigravity in T3 Code's settings first.
+
+Sign-in and sign-out always happen in Google's own program. Tori saves account names and never reads, copies or writes your logins, including T3 Code's. After switching, restart T3 Code or start a new chat.
+
+Gemini CLI, the Antigravity IDE and Antigravity Desktop 1.x are not supported.
 
 Everything is available in the picker:
 
 - **Add:** press `a`, choose Antigravity, name the account, and sign in with Google. If you're already signed in, choose to save only the name.
-- **Install:** if `agy` is missing, Tori shows Google's installer command and runs it when you confirm, then carries on.
-- **Switch:** select an account and press `Enter`.
-- **Sign in again or sign out:** press `Enter` on the account marked signed in.
+- **Install:** if no Antigravity is found, Tori offers to install `agy` with Google's official installer, then carries on. For T3 Code, install Antigravity in T3 Code's settings instead.
+- **Switch:** select an account and press `Enter`. With more than one target, a checklist asks where to sign in (`Space` toggles, `Enter` starts, `Esc` cancels). Tori remembers your last choice.
+- **Sign in again or sign out:** press `Enter` on the account marked signed in. Sign-out shows the same checklist.
 
 The same actions from the command line:
 
@@ -108,17 +115,19 @@ tori g install            # run Google's official installer (asks first)
 tori g login work         # sign in with Google, save the account as "work"
 tori g login personal     # sign in with your next account
 tori g switch work        # switching is a new Google sign-in
-tori g logout             # opens agy to run /logout; type /exit to come back
+tori g logout             # agy opens for /logout (type /exit to come back); T3 Code signs out by itself
+tori g login work --t3    # pick targets: --agy, --t3 (all T3 Code instances), --t3=<instance>
 ```
 
-- **Every switch needs a sign-in.** `agy` prints a link; open it, choose the account, and paste the code back. Press `Ctrl+D` to cancel (`Ctrl+Z`, then `Enter`, on Windows).
+- **Every switch needs a sign-in.** For `agy`, it prints a link; open it, choose the account, and paste the code back. Press `Ctrl+D` to cancel (`Ctrl+Z`, then `Enter`, on Windows). For T3 Code, Tori opens Google's page once and also prints the link; finish in the browser, or press `Ctrl+C` to cancel. A cancelled switch can leave T3 Code signed out until you sign in again.
+- **Targets.** Each T3 Code Antigravity instance that uses Google sign-in is one target ("T3 Code", or "T3 Code: name" if there are several). Without a flag, Tori uses your last choice, or every installed target.
 - **No automatic rotation.** Name the account you want; `tori switch` and `b` in the picker skip Antigravity.
-- **The `*` marks the account last signed in through Tori.** If you sign in or out directly in `agy`, Tori doesn't notice. Run `tori g add <name>` to correct it.
+- **The `*` marks the account last signed in through Tori on any target.** `tori g list` and `tori g status` show which targets. If you sign in or out directly in `agy` or T3 Code, Tori doesn't notice. Run `tori g add <name>` to correct it.
 - **Quota is opt-in** (`tori usage on g`). Tori then reads the current `agy` login to show quota for the signed-in account. It never renews that login; if it has expired, open `agy`.
 
 #### Upgrading from 0.3.0 or earlier
 
-Antigravity Desktop, IDE, and T3 Code support has been removed. Your account names are kept, but the tokens older versions saved are no longer used. To delete them, press `x` in the picker, or run:
+Older versions saved Antigravity tokens, and they are no longer used. Your account names are kept, but the tokens older versions saved are no longer used. To delete them, press `x` in the picker, or run:
 
 ```bash
 tori g cleanup            # lists the files and asks first
@@ -130,7 +139,8 @@ tori g cleanup            # lists the files and asks first
 |---|---|---|---|---|
 | **Claude Code** | Supported | Supported | Supported | `.credentials.json` (Linux/Windows), macOS Keychain (`Claude Code-credentials`), `CLAUDE_CONFIG_DIR`, and `CLAUDE_SECURESTORAGE_CONFIG_DIR` |
 | **Codex CLI** | Supported | Supported | Supported | ChatGPT OAuth & API keys via `auth.json` and OS keyring (`Codex Auth`). On Windows, Credential Manager's 2,560-byte limit fits API keys only; OAuth logins use `file` (default) or `auto` |
-| **Antigravity CLI** | Supported | Supported | Supported | Sign-in through `agy` itself. Opt-in quota reads `agy`'s OS keyring entry or token file |
+| **Antigravity CLI and App** | Supported | Supported | Supported | Sign-in through `agy` itself; the App shares it. Opt-in quota reads `agy`'s OS keyring entry or token file |
+| **T3 Code (Antigravity)** | Supported | Supported (untested) | Supported (untested) | Uses T3 Code's own copy of Google's runtime. Tori never downloads it |
 
 > **macOS Keychain note:** On macOS, the first time `claude` or `codex` reads a Keychain item written by Tori, or Tori reads `agy`'s item for quota, macOS may show a one-time "Allow access" prompt.
 
@@ -199,6 +209,7 @@ Preferences live in `~/.tori/config.json` and saved credentials under `~/.tori/{
 | `CODEX_HOME`, `TORI_CODEX_AUTH` | Override Codex CLI auth path |
 | `TORI_AGY_BIN` | Override the path to `agy` |
 | `TORI_AGY_CLI_TOKEN` | Override the `agy` token file read by opt-in quota meters |
+| `T3CODE_HOME` | T3 Code's data folder (default `~/.t3`), the same variable T3 Code reads |
 
 ## Privacy & terms
 
@@ -214,11 +225,11 @@ Sign in with `claude` or `codex login`, save the account in Tori, and repeat for
 
 ### Does Tori support Gemini CLI or the Antigravity IDE?
 
-No. For Google accounts Tori supports the Antigravity CLI (`agy`) only. Antigravity Desktop, the IDE, T3 Code, and Gemini CLI are not supported. `tori gemini` is only a command alias for Antigravity.
+No. For Google accounts Tori supports the Antigravity CLI and App (`agy`, which the App shares) and T3 Code's Antigravity provider. The Antigravity IDE, Antigravity Desktop 1.x and Gemini CLI are not supported. `tori gemini` is only a command alias for Antigravity.
 
 ### How does Antigravity account switching work?
 
-Each switch is a new Google sign-in in `agy`. Tori doesn't rotate Antigravity accounts, and its quota meters are off by default.
+Each switch is a new Google sign-in, in `agy` and in T3 Code's own runtime for the targets you pick. Tori never handles the login, so restart T3 Code or start a new chat afterwards. Tori doesn't rotate Antigravity accounts, and its quota meters are off by default.
 
 ### Is Tori made by Anthropic, OpenAI, or Google?
 

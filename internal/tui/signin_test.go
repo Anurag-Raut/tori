@@ -309,3 +309,129 @@ func agyRow(t *testing.T, m Model, active bool) flatRow {
 	t.Fatalf("no Antigravity row with active=%v", active)
 	return flatRow{}
 }
+
+// withT3Target adds a T3 Code Antigravity instance to the model's env. Its
+// runtime is a stub that is never started in these tests.
+func withT3Target(t *testing.T, m Model) Model {
+	t.Helper()
+	envMap := map[string]string{}
+	old := m.env.Environ
+	m.env.Environ = func(k string) string {
+		if v, ok := envMap[k]; ok {
+			return v
+		}
+		return old(k)
+	}
+	base := filepath.Join(t.TempDir(), "t3")
+	envMap["T3CODE_HOME"] = base
+	stub := filepath.Join(t.TempDir(), "agy")
+	if err := store.WriteBytesAtomic(stub, []byte("stub"), 0o700, false); err != nil {
+		t.Fatal(err)
+	}
+	settings := map[string]any{"providerInstances": map[string]any{
+		"antigravity": map[string]any{"driver": "antigravity", "enabled": true, "config": map[string]any{"binaryPath": stub}},
+	}}
+	if err := store.WriteJSONAtomic(filepath.Join(base, "userdata", "settings.json"), settings, 0o600, false); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestSwitchAsksWhichTargetsAndRemembers(t *testing.T) {
+	m, _, ran, _ := signInModel(t, "work", "personal")
+	m = withT3Target(t, m)
+
+	m, _ = m.activateRow(agyRow(t, m, false))
+	if m.dlg.kind != dialogTargets {
+		t.Fatalf("expected the checklist, kind=%v", m.dlg.kind)
+	}
+	if !strings.HasPrefix(m.dlg.title, "Switch Antigravity to ") {
+		t.Fatalf("title = %q", m.dlg.title)
+	}
+	view := m.View()
+	for _, want := range []string{"[x] Antigravity CLI & App", "(agy)", "[x] T3 Code", "restart or start a new chat after", "space toggle", "esc cancel"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in\n%s", want, view)
+		}
+	}
+	// Unchecking everything keeps the dialog open with a warning.
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")})
+	m, _ = press(t, m, keyType(tea.KeyDown))
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")})
+	m, cmd := press(t, m, keyType(tea.KeyEnter))
+	if cmd != nil || m.dlg.kind != dialogTargets || !m.dlg.needTarget || !strings.Contains(m.View(), "Pick at least one") {
+		t.Fatalf("nothing checked must not start: kind=%v", m.dlg.kind)
+	}
+	// Check agy only and start.
+	m, _ = press(t, m, keyType(tea.KeyUp))
+	m, _ = press(t, m, tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")})
+	m, cmd = press(t, m, keyType(tea.KeyEnter))
+	if m.dlg.kind != dialogNone || cmd == nil {
+		t.Fatalf("expected the sign-in to start, kind=%v", m.dlg.kind)
+	}
+	m, _ = execCmd(m, cmd)
+	if len(*ran) != 1 || strings.Join((*ran)[0][1:], " ") != "acp --login" {
+		t.Fatalf("ran %q", *ran)
+	}
+	// The choice is remembered: next time only agy is pre-checked.
+	m, _ = m.activateRow(agyRow(t, m, false))
+	if m.dlg.kind != dialogTargets || !m.dlg.checked[0] || m.dlg.checked[1] {
+		t.Fatalf("remembered selection not used: kind=%v checked=%v", m.dlg.kind, m.dlg.checked)
+	}
+	// Esc cancels without signing in.
+	m, _ = press(t, m, keyType(tea.KeyEsc))
+	if m.dlg.kind != dialogNone || len(*ran) != 1 {
+		t.Fatalf("esc: kind=%v ran=%d", m.dlg.kind, len(*ran))
+	}
+}
+
+func TestSingleTargetSkipsChecklist(t *testing.T) {
+	m, _, ran, _ := signInModel(t, "work", "personal")
+	m, cmd := m.activateRow(agyRow(t, m, false))
+	if m.dlg.kind != dialogNone || cmd == nil {
+		t.Fatalf("kind=%v", m.dlg.kind)
+	}
+	execCmd(m, cmd)
+	if len(*ran) != 1 {
+		t.Fatalf("ran %q", *ran)
+	}
+}
+
+func TestSignOutShowsChecklistWithTwoTargets(t *testing.T) {
+	m, _, _, _ := signInModel(t, "work")
+	m = withT3Target(t, m)
+	m, _ = m.activateRow(agyRow(t, m, true))
+	m, _ = press(t, m, keyType(tea.KeyDown))
+	m, _ = press(t, m, keyType(tea.KeyEnter))
+	if m.dlg.kind != dialogTargets || m.dlg.title != "Sign out of Antigravity" {
+		t.Fatalf("kind=%v title=%q", m.dlg.kind, m.dlg.title)
+	}
+}
+
+func TestNothingInstalledOffersInstallWithT3Hint(t *testing.T) {
+	m, env, _, _ := signInModel(t, "work", "personal")
+	if err := os.Remove(env.Getenv("TORI_AGY_BIN")); err != nil {
+		t.Fatal(err)
+	}
+	m, _ = m.activateRow(agyRow(t, m, false))
+	if m.dlg.kind != dialogInstall {
+		t.Fatalf("kind=%v", m.dlg.kind)
+	}
+	view := m.View()
+	for _, want := range []string{"No Antigravity app found", "Install the Antigravity CLI (agy) now?", "also covers the Antigravity App", "Using T3 Code?", "Install", "Cancel"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in\n%s", want, view)
+		}
+	}
+	// Cancel installs nothing.
+	m, _ = press(t, m, keyType(tea.KeyDown))
+	m, cmd := press(t, m, keyType(tea.KeyEnter))
+	if m.dlg.kind != dialogNone || cmd != nil {
+		t.Fatalf("cancel: kind=%v", m.dlg.kind)
+	}
+	// The add flow offers it too.
+	m, _ = m.openSignIn(&provider.Antigravity{})
+	if m.dlg.kind != dialogInstall {
+		t.Fatalf("add: kind=%v", m.dlg.kind)
+	}
+}

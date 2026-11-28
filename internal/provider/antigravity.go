@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -44,8 +45,24 @@ var agySlotFiles = []string{agyAccountFile, "auth.json", "acp_token.json"}
 type Antigravity struct{}
 
 type agyAccount struct {
-	// SignedInAt is set on the one account last signed in through Tori.
+	// SignedIn holds, per target ID, when Tori last signed this account in there.
+	SignedIn map[string]int64 `json:"signedIn,omitempty"`
+	// SignedInAt is the older single marker. It is read as the agy sign-in.
 	SignedInAt int64 `json:"signedInAt,omitempty"`
+}
+
+// times returns the sign-in times by target, including an old signedInAt.
+func (a agyAccount) times() map[string]int64 {
+	out := make(map[string]int64, len(a.SignedIn)+1)
+	for k, v := range a.SignedIn {
+		out[k] = v
+	}
+	if a.SignedInAt > 0 {
+		if _, ok := out[TargetAgy]; !ok {
+			out[TargetAgy] = a.SignedInAt
+		}
+	}
+	return out
 }
 
 func (g *Antigravity) Key() string       { return "antigravity" }
@@ -59,10 +76,15 @@ func (g *Antigravity) PermError() string { return "open agy to renew" }
 func (g *Antigravity) SetupHint() string {
 	return "Run `tori g login <name>` to sign in with Google."
 }
-func (g *Antigravity) HelpTitle() string { return "Antigravity CLI (`agy`) accounts" }
+func (g *Antigravity) HelpTitle() string {
+	return "Antigravity accounts (agy CLI and App, and T3 Code)"
+}
 func (g *Antigravity) SetupText() string {
-	return "Setup: `tori g install`, then `tori g login work` and `tori g login personal`.\n" +
-		"Every switch is a new Google sign-in. Tori saves account names, never logins."
+	return "Setup: `tori g install` for agy (it also covers the Antigravity App), or install Antigravity\n" +
+		"in T3 Code's settings. Then `tori g login work` and `tori g login personal`.\n" +
+		"Every switch is a new Google sign-in. Tori saves account names, never logins.\n" +
+		"T3 Code uses its own copy of Google's runtime. Restart T3 Code or start a new chat after switching.\n" +
+		"Pick targets with --agy, --t3 or --t3=<instance>; Tori remembers your last choice."
 }
 
 func (g *Antigravity) Slots(env *Env) ([]store.Slot, error) {
@@ -122,8 +144,12 @@ func (g *Antigravity) binary(env *Env) (string, bool) {
 	return "", false
 }
 
-// Installed reports whether agy is available.
+// Installed reports whether any target is available: agy, or T3 Code's runtime.
 func (g *Antigravity) Installed(env *Env) bool {
+	return len(g.Targets(env)) > 0
+}
+
+func (g *Antigravity) agyInstalled(env *Env) bool {
 	_, ok := g.binary(env)
 	return ok
 }
@@ -170,7 +196,7 @@ func (g *Antigravity) run(env *Env, args ...string) error {
 
 // signIn runs Google's own terminal sign-in. Tori never sees the credentials.
 func (g *Antigravity) signIn(env *Env, who string) error {
-	if !g.Installed(env) {
+	if !g.agyInstalled(env) {
 		return Fail("agy isn't installed. Run `tori g install` first.")
 	}
 	if who != "" {
@@ -222,19 +248,79 @@ func (g *Antigravity) newSlot(env *Env, name string, accts []store.Slot) (store.
 	return slot, nil
 }
 
-// setSignedIn marks slot number n as the signed-in account and unmarks the rest.
-// n == 0 unmarks every account.
-func (g *Antigravity) setSignedIn(env *Env, accts []store.Slot, n int) error {
+// setSignedIn marks slot number n as signed in on the given targets and unmarks
+// the other slots there. n == 0 unmarks every account on those targets. Marks on
+// other targets stay as they are.
+func (g *Antigravity) setSignedIn(env *Env, accts []store.Slot, n int, ids []string) error {
 	for _, s := range accts {
-		var acct agyAccount
-		if s.Number == n {
-			acct.SignedInAt = env.now().Unix()
+		var raw agyAccount
+		store.ReadJSON(filepath.Join(s.Dir, agyAccountFile), &raw)
+		times := raw.times()
+		for _, id := range ids {
+			if s.Number == n {
+				times[id] = env.now().Unix()
+			} else {
+				delete(times, id)
+			}
+		}
+		acct := agyAccount{}
+		if len(times) > 0 {
+			acct.SignedIn = times
 		}
 		if err := store.WriteJSONAtomic(filepath.Join(s.Dir, agyAccountFile), acct, 0o600, false); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// signInTargets signs in on each target in turn and returns the targets that
+// succeeded. When one fails, the rest are skipped.
+func (g *Antigravity) signInTargets(env *Env, who string) ([]Target, []string, error) {
+	sel, err := g.selection(env)
+	if err != nil {
+		return nil, nil, err
+	}
+	var done []Target
+	var notes []string
+	for _, t := range sel {
+		var err error
+		if t.IsT3() {
+			err = g.signInT3(env, t, who)
+			if err == nil {
+				if who != "" {
+					notes = append(notes, fmt.Sprintf("T3 Code now uses %s. Restart T3 Code or start a new chat.", who))
+				} else {
+					notes = append(notes, "T3 Code is signed in. Restart T3 Code or start a new chat.")
+				}
+			}
+		} else {
+			err = g.signIn(env, who)
+			if err == nil {
+				notes = append(notes, "Restart any open `agy` session to use it.")
+			}
+		}
+		if err != nil {
+			if len(done) > 0 {
+				names := make([]string, len(done))
+				for i, d := range done {
+					names[i] = d.Short
+				}
+				err = Failf("%s (still signed in on: %s)", err.Error(), strings.Join(names, ", "))
+			}
+			return done, notes, err
+		}
+		done = append(done, t)
+	}
+	return done, notes, nil
+}
+
+func targetIDs(ts []Target) []string {
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		out[i] = t.ID
+	}
+	return out
 }
 
 // Login signs in with Google. A name saves the account, or selects a saved one.
@@ -253,15 +339,20 @@ func (g *Antigravity) Login(env *Env, name string) ([]string, error) {
 			who = g.Label(target.Number, target.Meta)
 		}
 	}
-	if err := g.signIn(env, who); err != nil {
-		return nil, err
+	done, notes, signErr := g.signInTargets(env, who)
+	if len(done) == 0 {
+		return nil, signErr
 	}
+	ids := targetIDs(done)
 	if name == "" {
-		// Tori can't tell which account this is, so none stays marked.
-		if err := g.setSignedIn(env, accts, 0); err != nil {
+		// Tori can't tell which account this is, so none stays marked there.
+		if err := g.setSignedIn(env, accts, 0, ids); err != nil {
 			return nil, err
 		}
-		return []string{"Signed in. To switch back to this account later, name it: tori g add <name>"}, nil
+		if signErr != nil {
+			return nil, signErr
+		}
+		return append([]string{"Signed in. To switch back to this account later, name it: tori g add <name>"}, notes...), nil
 	}
 	verb := "Signed in to"
 	if target == nil {
@@ -273,11 +364,14 @@ func (g *Antigravity) Login(env *Env, name string) ([]string, error) {
 		target = &slot
 		verb = "Signed in and added"
 	}
-	if err := g.setSignedIn(env, accts, target.Number); err != nil {
+	if err := g.setSignedIn(env, accts, target.Number, ids); err != nil {
 		return nil, err
 	}
 	ClearUsageCooldown(target.Dir)
-	return []string{fmt.Sprintf("%s slot %d: %s", verb, target.Number, g.Label(target.Number, target.Meta))}, nil
+	if signErr != nil {
+		return nil, signErr
+	}
+	return append([]string{fmt.Sprintf("%s slot %d: %s", verb, target.Number, g.Label(target.Number, target.Meta))}, notes...), nil
 }
 
 // Add names the account agy is already signed in to, without a new sign-in.
@@ -285,7 +379,7 @@ func (g *Antigravity) Add(env *Env, args []string) ([]string, error) {
 	if len(args) == 0 || args[0] == "" {
 		return nil, Fail("name the account: tori g add <name>")
 	}
-	if !g.Installed(env) {
+	if !g.agyInstalled(env) {
 		return nil, Fail("agy isn't installed. Run `tori g install` first.")
 	}
 	accts, err := g.Slots(env)
@@ -306,7 +400,7 @@ func (g *Antigravity) Add(env *Env, args []string) ([]string, error) {
 		target = &slot
 		verb = "Added"
 	}
-	if err := g.setSignedIn(env, accts, target.Number); err != nil {
+	if err := g.setSignedIn(env, accts, target.Number, []string{TargetAgy}); err != nil {
 		return nil, err
 	}
 	ClearUsageCooldown(target.Dir)
@@ -316,36 +410,66 @@ func (g *Antigravity) Add(env *Env, args []string) ([]string, error) {
 	}, nil
 }
 
-// Logout opens agy to run its own /logout; agy has no non-interactive sign-out.
+// Logout signs out of the chosen targets. agy has no non-interactive sign-out,
+// so it opens agy to run its own /logout. T3 Code signs out through its runtime.
 func (g *Antigravity) Logout(env *Env) ([]string, error) {
-	if !g.Installed(env) {
-		return nil, Fail("agy isn't installed. Run `tori g install` first.")
-	}
-	env.say("Opening agy to sign out. If you're still signed in, type /logout.")
-	env.say("Type /exit to come back.\n")
-	if err := g.run(env, "-i", "/logout"); err != nil {
-		return nil, Failf("agy exited with an error (%v).", err)
-	}
-	accts, err := g.Slots(env)
+	sel, err := g.selection(env)
 	if err != nil {
 		return nil, err
 	}
-	if err := g.setSignedIn(env, accts, 0); err != nil {
-		return nil, err
+	var done []Target
+	var failure error
+	for _, t := range sel {
+		if t.IsT3() {
+			if err := g.signOutT3(env, t); err != nil {
+				failure = err
+				break
+			}
+		} else {
+			env.say("Opening agy to sign out. If you're still signed in, type /logout.")
+			env.say("Type /exit to come back.\n")
+			if err := g.run(env, "-i", "/logout"); err != nil {
+				failure = Failf("agy exited with an error (%v).", err)
+				break
+			}
+		}
+		done = append(done, t)
 	}
-	return []string{"Tori no longer marks any Antigravity account as signed in."}, nil
+	if len(done) > 0 {
+		accts, err := g.Slots(env)
+		if err != nil {
+			return nil, err
+		}
+		if err := g.setSignedIn(env, accts, 0, targetIDs(done)); err != nil {
+			return nil, err
+		}
+	}
+	if failure != nil {
+		return nil, failure
+	}
+	if len(sel) == len(g.Targets(env)) {
+		return []string{"Tori no longer marks any Antigravity account as signed in."}, nil
+	}
+	names := make([]string, len(done))
+	for i, d := range done {
+		names[i] = d.Short
+	}
+	return []string{"Signed out of " + strings.Join(names, ", ") + ". Tori no longer marks an account there."}, nil
 }
 
 // Activate switches accounts with a new Google sign-in.
 func (g *Antigravity) Activate(env *Env, slot store.Slot, accts []store.Slot, _ *int) ([]string, error) {
-	if err := g.signIn(env, g.Label(slot.Number, slot.Meta)); err != nil {
-		return nil, err
+	done, notes, signErr := g.signInTargets(env, g.Label(slot.Number, slot.Meta))
+	if len(done) > 0 {
+		if err := g.setSignedIn(env, accts, slot.Number, targetIDs(done)); err != nil {
+			return nil, err
+		}
+		ClearUsageCooldown(slot.Dir)
 	}
-	if err := g.setSignedIn(env, accts, slot.Number); err != nil {
-		return nil, err
+	if signErr != nil {
+		return nil, signErr
 	}
-	ClearUsageCooldown(slot.Dir)
-	return []string{"Restart any open `agy` session to use it."}, nil
+	return notes, nil
 }
 
 // ClearLive is unsupported: only agy itself signs out.
@@ -353,24 +477,49 @@ func (g *Antigravity) ClearLive(*Env) (func() error, error) {
 	return nil, Fail("sign out with `tori g logout`")
 }
 
-// Current returns the account last signed in through Tori. It reads no logins,
-// so a sign-in made directly in agy isn't detected.
+// Current returns the account last signed in through Tori on any target. It
+// reads no logins, so a sign-in made directly in agy isn't detected.
 func (g *Antigravity) Current(_ *Env, accts []store.Slot) *int {
 	var best *int
 	var bestAt int64
 	for _, s := range accts {
 		var acct agyAccount
-		if store.ReadJSON(filepath.Join(s.Dir, agyAccountFile), &acct) && acct.SignedInAt > bestAt {
-			n := s.Number
-			best, bestAt = &n, acct.SignedInAt
+		if !store.ReadJSON(filepath.Join(s.Dir, agyAccountFile), &acct) {
+			continue
+		}
+		for _, at := range acct.times() {
+			if at > bestAt {
+				n := s.Number
+				best, bestAt = &n, at
+			}
 		}
 	}
 	return best
 }
 
+// SignedInTargets lists the target names the slot was last signed in to.
+func (g *Antigravity) SignedInTargets(env *Env, slot store.Slot) []string {
+	var acct agyAccount
+	store.ReadJSON(filepath.Join(slot.Dir, agyAccountFile), &acct)
+	var ids []string
+	for id := range acct.times() {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = g.targetShort(env, id)
+	}
+	return out
+}
+
 func (g *Antigravity) Status(env *Env) (StatusInfo, error) {
 	if !g.Installed(env) {
-		return StatusInfo{Message: "agy isn't installed. Run `tori g install`."}, nil
+		msg := "Nothing to sign in to. Run `tori g install` for agy, or sign in to Antigravity in T3 Code."
+		if g.t3Pending(env) {
+			msg += " Install Antigravity in T3 Code's settings first."
+		}
+		return StatusInfo{Message: msg}, nil
 	}
 	accts, err := g.Slots(env)
 	if err != nil {
@@ -381,16 +530,22 @@ func (g *Antigravity) Status(env *Env) (StatusInfo, error) {
 		return StatusInfo{Message: "No account signed in through Tori. Run `tori g login <name>`."}, nil
 	}
 	var label string
+	var where []string
 	for _, s := range accts {
 		if s.Number == *cur {
 			label = g.Label(s.Number, s.Meta)
+			where = g.SignedInTargets(env, s)
 		}
+	}
+	msg := fmt.Sprintf("Current: slot %d (%s), last signed in through Tori", *cur, label)
+	if len(where) > 0 {
+		msg += " on " + strings.Join(where, ", ")
 	}
 	return StatusInfo{
 		LoggedIn:    true,
 		DisplayName: label,
 		ManagedSlot: cur,
-		Message:     fmt.Sprintf("Current: slot %d (%s), last signed in through Tori", *cur, label),
+		Message:     msg,
 	}, nil
 }
 

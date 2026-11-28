@@ -23,6 +23,7 @@ const (
 	dialogAddSave
 	dialogAddName
 	dialogInstall
+	dialogTargets
 	dialogAccount
 	dialogCleanup
 	dialogRemove
@@ -64,6 +65,13 @@ type dialogState struct {
 	// then continues what the user was doing once the install succeeds.
 	then  func(Model) (Model, tea.Cmd)
 	files []string // old token files listed for deletion
+
+	// The Antigravity target checklist.
+	targets    []provider.Target
+	checked    []bool
+	title      string
+	pick       func(Model, []string) (Model, tea.Cmd)
+	needTarget bool // Enter was pressed with nothing checked
 }
 
 func (d *dialogState) close() {
@@ -114,6 +122,17 @@ func (m Model) dialogChoices() []dialogChoice {
 			{id: "install", label: "Install"},
 			{id: "cancel", label: "Cancel"},
 		}
+
+	case dialogTargets:
+		out := make([]dialogChoice, len(m.dlg.targets))
+		for i, t := range m.dlg.targets {
+			box := "[ ]"
+			if i < len(m.dlg.checked) && m.dlg.checked[i] {
+				box = "[x]"
+			}
+			out[i] = dialogChoice{id: "target:" + t.ID, label: fmt.Sprintf("%s %-22s %s", box, t.Name, t.Note)}
+		}
+		return out
 
 	case dialogAccount:
 		return []dialogChoice{
@@ -176,6 +195,9 @@ func (m Model) dialogChoices() []dialogChoice {
 // and its outer bounding rectangle (within the screen below the header).
 func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
 	innerW := 44
+	if m.dlg.kind == dialogTargets {
+		innerW = 62
+	}
 	maxBoxW := max(26, m.layout.termW-4)
 	if innerW+6 > maxBoxW {
 		innerW = max(20, maxBoxW-6)
@@ -342,9 +364,9 @@ func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
 		if !ok {
 			return "", nil, dialogRect{}
 		}
-		lines = append(lines, m.theme.dialogTitle.Render("Install agy?"))
+		lines = append(lines, m.theme.dialogTitle.Render("No Antigravity app found"))
 		lines = append(lines, "")
-		addWrapped("agy isn't installed. This runs Google's official installer, which may update your shell PATH:", m.theme.text)
+		addWrapped("Install the Antigravity CLI (agy) now? It also covers the Antigravity App. This runs Google's official installer, which may update your shell PATH:", m.theme.text)
 		lines = append(lines, "")
 		for _, ln := range wrapPlain(sp.InstallCommand(m.env), innerW-2) {
 			// The address is one long word; break it rather than widen the box.
@@ -353,8 +375,20 @@ func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
 			}
 		}
 		lines = append(lines, "")
+		addWrapped("Using T3 Code? Install Antigravity in T3 Code's settings, then come back.", m.theme.dim)
+		lines = append(lines, "")
 		renderChoices(m.dialogChoices())
 		hintLine = renderHint(m.glyphs.keyEnter, "choose", "esc", "cancel")
+
+	case dialogTargets:
+		lines = append(lines, m.theme.dialogTitle.Render(fitCell(m.dlg.title, innerW, false)))
+		lines = append(lines, "")
+		renderChoices(m.dialogChoices())
+		if m.dlg.needTarget {
+			lines = append(lines, "")
+			addWrappedPrefix(m.glyphs.warn+" ", "Pick at least one.", m.theme.warn)
+		}
+		hintLine = renderHint("space", "toggle", m.glyphs.keyEnter, "sign in", "esc", "cancel")
 
 	case dialogAccount:
 		if m.dlg.account == nil {
@@ -364,7 +398,7 @@ func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
 		lines = append(lines, m.theme.dialogTitle.Render(fitCell(acct.Email, innerW, false)))
 		lines = append(lines, m.theme.dim.Render(fitCell(fmt.Sprintf("Slot %d %s marked signed in", acct.Number, m.glyphs.sep), innerW, false)))
 		lines = append(lines, "")
-		addWrapped("Sign out opens agy. Type /logout if you're still signed in, then /exit to come back.", m.theme.dim)
+		addWrapped("Sign out opens agy (type /logout if you're still signed in, then /exit). T3 Code signs out by itself.", m.theme.dim)
 		lines = append(lines, "")
 		renderChoices(m.dialogChoices())
 		hintLine = renderHint(m.glyphs.keyEnter, "choose", "esc", "cancel")

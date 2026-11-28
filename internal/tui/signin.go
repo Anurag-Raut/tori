@@ -217,8 +217,78 @@ func (m Model) submitName(id string) (tea.Model, tea.Cmd) {
 	if id == "save" {
 		return m, saveNameCmd(m.env, p, name)
 	}
-	return m, m.signInCmd(p, fmt.Sprintf("Signed in to %s", name), func(env *provider.Env) error {
-		_, err := p.Login(env, name)
-		return err
+	return m.withTargets(p, "Sign in Antigravity as "+name, func(m Model, ids []string) (Model, tea.Cmd) {
+		return m, m.signInCmd(p, fmt.Sprintf("Signed in to %s", name), func(env *provider.Env) error {
+			env.Targets = ids
+			_, err := p.Login(env, name)
+			return err
+		})
 	})
+}
+
+// withTargets runs act with the Antigravity targets to sign in to. With several
+// targets it asks first; with one it just goes (nil means the default choice).
+func (m Model) withTargets(p provider.SignInProvider, title string, act func(Model, []string) (Model, tea.Cmd)) (Model, tea.Cmd) {
+	tp, ok := p.(provider.TargetedProvider)
+	if !ok {
+		return act(m, nil)
+	}
+	targets := tp.Targets(m.env)
+	if len(targets) <= 1 {
+		return act(m, nil)
+	}
+	remembered := tp.Remembered(m.env)
+	m.dlg.close()
+	m.dlg.kind = dialogTargets
+	m.dlg.provider = p
+	m.dlg.targets = targets
+	m.dlg.title = title
+	m.dlg.pick = act
+	m.dlg.checked = make([]bool, len(targets))
+	for i, t := range targets {
+		for _, id := range remembered {
+			if id == t.ID {
+				m.dlg.checked[i] = true
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m Model) toggleTarget() Model {
+	checked := append([]bool(nil), m.dlg.checked...)
+	if i := m.dlg.cursor; i >= 0 && i < len(checked) {
+		checked[i] = !checked[i]
+	}
+	m.dlg.checked = checked
+	m.dlg.needTarget = false
+	return m
+}
+
+// handleTargetsKey moves, toggles with space, and starts with Enter.
+func (m Model) handleTargetsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	n := len(m.dlg.targets)
+	switch {
+	case msg.Type == tea.KeySpace || msg.String() == " ":
+		return m.toggleTarget(), nil
+	case key.Matches(msg, m.keys.Down):
+		m.dlg.cursor = (m.dlg.cursor + 1) % n
+	case key.Matches(msg, m.keys.Up):
+		m.dlg.cursor = (m.dlg.cursor - 1 + n) % n
+	case key.Matches(msg, m.keys.Switch):
+		var ids []string
+		for i, t := range m.dlg.targets {
+			if m.dlg.checked[i] {
+				ids = append(ids, t.ID)
+			}
+		}
+		if len(ids) == 0 {
+			m.dlg.needTarget = true
+			return m, nil
+		}
+		pick := m.dlg.pick
+		m.dlg.close()
+		return pick(m, ids)
+	}
+	return m, nil
 }

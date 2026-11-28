@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,6 +95,16 @@ type Env struct {
 	Stdout     io.Writer
 	Stderr     io.Writer
 	RunCommand func(cmd *exec.Cmd) error
+
+	// Targets picks the Antigravity targets to sign in to (see Antigravity.Targets).
+	// Empty means the remembered choice, else every installed target.
+	Targets []string
+	// Ctx ends an Antigravity sign-in in T3 Code when cancelled. Nil means Ctrl+C only.
+	Ctx context.Context
+	// Executable returns Tori's own path, for the link opener. Nil uses os.Executable.
+	Executable func() (string, error)
+	// ProcEnviron lists the environment given to T3 Code's runtime. Nil uses os.Environ.
+	ProcEnviron func() []string
 }
 
 // NewEnv constructs a default Env from process environment variables.
@@ -223,6 +234,8 @@ type AccountEntry struct {
 	Plan   *PlanInfo  `json:"plan"`
 	Usage  *UsageInfo `json:"usage"`
 	Note   string     `json:"-"`
+	// SignedIn names the targets the account was last signed in to (Antigravity).
+	SignedIn []string `json:"-"`
 }
 
 // JSONList is the schemaVersion 1 JSON payload for `tori <tool> list --json`.
@@ -284,6 +297,15 @@ type SignInProvider interface {
 	Logout(env *Env) ([]string, error)
 	LegacyTokenFiles(env *Env) []string
 	DeleteLegacyTokens(env *Env) (int, error)
+}
+
+// TargetedProvider is a SignInProvider with several places to sign in to.
+type TargetedProvider interface {
+	SignInProvider
+	// Targets lists what can be signed in to now.
+	Targets(env *Env) []Target
+	// Remembered returns the target IDs to pre-check.
+	Remembered(env *Env) []string
 }
 
 // activeOnlyUsage is implemented by providers that can read quota only for the
@@ -820,7 +842,7 @@ func Entries(env *Env, p Provider, network, force bool) ([]AccountEntry, *int, e
 			planPtr = &PlanInfo{Label: s.Meta.Plan}
 		}
 		active := cur != nil && s.Number == *cur
-		out = append(out, AccountEntry{
+		entry := AccountEntry{
 			Number: s.Number,
 			Email:  name,
 			Alias:  aliasPtr,
@@ -828,7 +850,13 @@ func Entries(env *Env, p Provider, network, force bool) ([]AccountEntry, *int, e
 			Plan:   planPtr,
 			Usage:  usage[s.Number],
 			Note:   p.ListNote(s.Meta),
-		})
+		}
+		if tp, ok := p.(interface {
+			SignedInTargets(*Env, store.Slot) []string
+		}); ok {
+			entry.SignedIn = tp.SignedInTargets(env, s)
+		}
+		out = append(out, entry)
 	}
 	return out, cur, nil
 }

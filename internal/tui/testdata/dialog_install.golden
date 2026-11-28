@@ -2,15 +2,19 @@
 
                          +------------------------------------------------+                         
                          |                                                |                         
-                         |  Install agy?                                  |                         
+                         |  No Antigravity app found                      |                         
                          |                                                |                         
-                         |  agy isn't installed. This runs Google's       |                         
-                         |  official installer, which may update your     |                         
-                         |  shell PATH:                                   |                         
+                         |  Install the Antigravity CLI (agy) now? It     |                         
+                         |  also covers the Antigravity App. This runs    |                         
+                         |  Google's official installer, which may        |                         
+                         |  update your shell PATH:                       |                         
                          |                                                |                         
                          |    curl -fsSL                                  |                         
                          |    https://antigravity.google/cli/install.sh   |                         
                          |    | bash                                      |                         
+                         |                                                |                         
+                         |  Using T3 Code? Install Antigravity in T3      |                         
+                         |  Code's settings, then come back.              |                         
                          |                                                |                         
                          |   Install                                      |                         
                          |   Cancel                                       |                         
