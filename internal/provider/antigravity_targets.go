@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Anurag-Raut/tori/internal/config"
@@ -293,7 +294,7 @@ func (g *Antigravity) acpFail(err error, doing string) error {
 // signInT3 runs Google's sign-in in T3 Code's runtime: sign out first, so the
 // runtime asks for Google again, then authenticate.
 func (g *Antigravity) signInT3(env *Env, t Target, who string) error {
-	ctx, stopSig := signal.NotifyContext(env.context(), os.Interrupt)
+	ctx, stopSig := signal.NotifyContext(env.context(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stopSig()
 	if who != "" {
 		env.say("Sign in to Google as %s for %s.", who, t.Name)
@@ -338,7 +339,7 @@ func (g *Antigravity) signInT3(env *Env, t Target, who string) error {
 
 // signOutT3 signs T3 Code's instance out through its own runtime.
 func (g *Antigravity) signOutT3(env *Env, t Target) error {
-	ctx, stopSig := signal.NotifyContext(env.context(), os.Interrupt)
+	ctx, stopSig := signal.NotifyContext(env.context(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stopSig()
 	env.say("Signing %s out of Google. This can take up to 30 seconds.", t.Name)
 	c, hasLogout, _, err := g.startT3(env, ctx, t.t3, true)
