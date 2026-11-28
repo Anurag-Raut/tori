@@ -81,7 +81,8 @@ function main() {
     const manifest = {
       name: t.pkg,
       version,
-      description: `${mainPkg.description} (${t.os}/${t.cpu} binary)`,
+      // Kept short so npm search leads people to the main package.
+      description: `Prebuilt ${t.os}/${t.cpu} binary used by ${mainPkg.name}. Install ${mainPkg.name} instead.`,
       license: mainPkg.license,
       repository: mainPkg.repository,
       homepage: mainPkg.homepage,

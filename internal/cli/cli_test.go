@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -271,5 +273,79 @@ func TestFullCLICRUDAndJSONAndEmptyLast(t *testing.T) {
 	rc, out, _ = runCmd(env, "", false, "x", "list", "--no-usage")
 	if rc != 0 || !strings.Contains(out, "1: two@example.com") {
 		t.Fatalf("expected slot 2 renumbered to 1, got:\n%s", out)
+	}
+}
+
+func TestAntigravitySignInCommands(t *testing.T) {
+	env, _ := setupCLIEnv(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Errorf("unexpected request: %s", r.URL)
+		return nil, errors.New("no net")
+	}))
+	var ran [][]string
+	env.RunCommand = func(cmd *exec.Cmd) error {
+		ran = append(ran, cmd.Args)
+		if cmd.Args[0] == "bash" {
+			return store.WriteBytesAtomic(filepath.Join(env.Home, ".local", "bin", "agy"), []byte("stub"), 0o700, false)
+		}
+		return nil
+	}
+
+	// Install asks first and runs nothing until confirmed.
+	if rc, _, errOut := runCmd(env, "", false, "g", "install"); rc == 0 || !strings.Contains(errOut, "--yes") {
+		t.Fatalf("install without confirmation: rc=%d err=%q", rc, errOut)
+	}
+	rc, out, _ := runCmd(env, "n\n", true, "g", "install")
+	if rc != 0 || len(ran) != 0 || !strings.Contains(out, "https://antigravity.google/cli/install.sh") || !strings.Contains(out, "Cancelled.") {
+		t.Fatalf("declined install: rc=%d ran=%q out=%q", rc, ran, out)
+	}
+	if rc, out, errOut := runCmd(env, "y\n", true, "g", "install"); rc != 0 || len(ran) != 1 {
+		t.Fatalf("install: rc=%d out=%q err=%q", rc, out, errOut)
+	}
+
+	for _, name := range []string{"work", "personal"} {
+		if rc, _, errOut := runCmd(env, "", false, "g", "login", name); rc != 0 {
+			t.Fatalf("login %s: %q", name, errOut)
+		}
+	}
+	if rc, _, errOut := runCmd(env, "", false, "g", "switch"); rc == 0 || !strings.Contains(errOut, "choose the account") {
+		t.Fatalf("bare switch: rc=%d err=%q", rc, errOut)
+	}
+	n := len(ran)
+	_, out, _ = runCmd(env, "", false, "switch")
+	if len(ran) != n || !strings.Contains(out, "Not rotated: switching needs a sign-in") {
+		t.Fatalf("rotate all must not sign in: ran=%q out=%q", ran[n:], out)
+	}
+	if rc, out, _ := runCmd(env, "", false, "g", "help"); rc != 0 || !strings.Contains(out, "tori g cleanup") {
+		t.Fatalf("help: rc=%d out=%q", rc, out)
+	}
+	if rc, _, errOut := runCmd(env, "", false, "g", "logout"); rc != 0 {
+		t.Fatalf("logout: %q", errOut)
+	}
+
+	// Old token copies are announced, and deleted only after confirmation.
+	old := filepath.Join(env.Root, "antigravity", "accounts", "1", "auth.json")
+	if err := store.WriteJSONAtomic(old, map[string]any{"refreshToken": "rt"}, 0o600, false); err != nil {
+		t.Fatal(err)
+	}
+	env.Warn = nil // Run binds warnings to its own stderr
+	if _, _, errOut := runCmd(env, "", false, "g", "list"); !strings.Contains(errOut, "tori g cleanup") {
+		t.Fatalf("expected old token notice, got %q", errOut)
+	}
+	if _, out, _ := runCmd(env, "n\n", true, "g", "cleanup"); !strings.Contains(out, "Cancelled.") {
+		t.Fatalf("declined cleanup: %q", out)
+	}
+	if _, err := os.Stat(old); err != nil {
+		t.Fatalf("declined cleanup deleted the file: %v", err)
+	}
+	if rc, out, _ := runCmd(env, "", false, "g", "cleanup", "--yes"); rc != 0 || !strings.Contains(out, "Deleted 1") {
+		t.Fatalf("cleanup: rc=%d out=%q", rc, out)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("expected old token removed, err=%v", err)
+	}
+
+	// The other tools have no sign-in commands.
+	if rc, _, errOut := runCmd(env, "", false, "c", "login"); rc == 0 || !strings.Contains(errOut, "unknown command") {
+		t.Fatalf("claude login: rc=%d err=%q", rc, errOut)
 	}
 }

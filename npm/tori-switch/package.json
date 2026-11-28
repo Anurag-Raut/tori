@@ -1,7 +1,7 @@
 {
   "name": "tori-switch",
   "version": "0.0.0",
-  "description": "Switch between Claude Code, Codex, and Antigravity accounts from your terminal — with live quota bars.",
+  "description": "Terminal TUI and CLI to switch Claude Code, OpenAI Codex CLI, and Antigravity CLI (agy) accounts, with live quota bars and rotation for Claude Code and Codex.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -13,13 +13,23 @@
   },
   "keywords": [
     "tori",
+    "claude-code",
+    "claude",
+    "anthropic",
+    "codex",
+    "codex-cli",
+    "openai",
+    "antigravity",
+    "antigravity-cli",
+    "agy",
+    "account-switcher",
+    "multi-account",
+    "quota",
+    "usage-tracker",
     "cli",
     "tui",
-    "claude-code",
-    "codex",
-    "antigravity",
-    "account-switcher",
-    "quota"
+    "terminal",
+    "golang"
   ],
   "bin": {
     "tori": "bin/tori.js"

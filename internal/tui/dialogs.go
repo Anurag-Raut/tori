@@ -2,8 +2,10 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
@@ -19,6 +21,10 @@ const (
 	dialogAddSignIn
 	dialogAddAlreadySaved
 	dialogAddSave
+	dialogAddName
+	dialogInstall
+	dialogAccount
+	dialogCleanup
 	dialogRemove
 	dialogMetersOn
 	dialogHelp
@@ -52,12 +58,25 @@ type dialogState struct {
 	initialSlot    *int // slot signed in when Add step 2 opened
 	stillSameLogin bool // true after a re-check finds the same saved account
 	notFound       bool // true after a re-check finds no live login
+	needName       bool // a choice was made with an empty account name
 	cursor         int  // index in current dialog choices
 	hoverIdx       int  // hovered choice index, -1 if none
+	// then continues what the user was doing once the install succeeds.
+	then  func(Model) (Model, tea.Cmd)
+	files []string // old token files listed for deletion
 }
 
 func (d *dialogState) close() {
 	*d = dialogState{hoverIdx: -1}
+}
+
+// removingInUse reports whether removing the account affects the live login.
+// Removing a sign-in provider's account only forgets its name.
+func (d dialogState) removingInUse() bool {
+	if _, ok := d.provider.(provider.SignInProvider); ok {
+		return false
+	}
+	return d.account != nil && d.account.Active
 }
 
 // dialogChoices returns the selectable choice list for the active dialog.
@@ -84,11 +103,37 @@ func (m Model) dialogChoices() []dialogChoice {
 			{id: "cancel", label: "Cancel"},
 		}
 
+	case dialogAddName:
+		return []dialogChoice{
+			{id: "signin", label: "Sign in with Google"},
+			{id: "save", label: "Already signed in: only save the name"},
+		}
+
+	case dialogInstall:
+		return []dialogChoice{
+			{id: "install", label: "Install"},
+			{id: "cancel", label: "Cancel"},
+		}
+
+	case dialogAccount:
+		return []dialogChoice{
+			{id: "signin", label: "Sign in again"},
+			{id: "signout", label: "Sign out"},
+			{id: "cancel", label: "Cancel"},
+		}
+
+	case dialogCleanup:
+		// Keeping the files is default (index 0).
+		return []dialogChoice{
+			{id: "cancel", label: "Keep them"},
+			{id: "delete", label: "Delete", destructive: true},
+		}
+
 	case dialogRemove:
 		if m.dlg.account == nil {
 			return nil
 		}
-		if !m.dlg.account.Active {
+		if !m.dlg.removingInUse() {
 			// Not in use: Cancel is default (index 0).
 			return []dialogChoice{
 				{id: "cancel", label: "Cancel"},
@@ -270,13 +315,87 @@ func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
 		lines = append(lines, m.theme.dim.Render("Alias ")+m.aliasInput.View())
 		hintLine = renderHint(m.glyphs.keyEnter, "save", "esc", "cancel")
 
+	case dialogAddName:
+		toolName := ""
+		if m.dlg.provider != nil {
+			toolName = m.dlg.provider.Title()
+		}
+		lines = append(lines, m.theme.dialogTitle.Render(fmt.Sprintf("Add %s account", toolName)))
+		lines = append(lines, "")
+		addWrapped("Name the account. To sign in, open the link agy prints and paste the code back.", m.theme.text)
+		lines = append(lines, "")
+		lines = append(lines, m.theme.dim.Render("Name  ")+m.aliasInput.View())
+		if m.dlg.needName {
+			addWrappedPrefix(m.glyphs.warn+" ", "Enter a name first.", m.theme.warn)
+		}
+		lines = append(lines, "")
+		renderChoices(m.dialogChoices())
+		// j and k type into the name, so only the arrows move here.
+		arrows := m.glyphs.keyMove
+		if m.glyphs.ascii {
+			arrows = "up/dn"
+		}
+		hintLine = renderHint(arrows, "choose", m.glyphs.keyEnter, "confirm", "esc", "cancel")
+
+	case dialogInstall:
+		sp, ok := m.dlg.provider.(provider.SignInProvider)
+		if !ok {
+			return "", nil, dialogRect{}
+		}
+		lines = append(lines, m.theme.dialogTitle.Render("Install agy?"))
+		lines = append(lines, "")
+		addWrapped("agy isn't installed. This runs Google's official installer, which may update your shell PATH:", m.theme.text)
+		lines = append(lines, "")
+		for _, ln := range wrapPlain(sp.InstallCommand(m.env), innerW-2) {
+			// The address is one long word; break it rather than widen the box.
+			for _, part := range strings.Split(ansi.Hardwrap(ln, innerW-2, false), "\n") {
+				lines = append(lines, m.theme.dim.Render("  "+part))
+			}
+		}
+		lines = append(lines, "")
+		renderChoices(m.dialogChoices())
+		hintLine = renderHint(m.glyphs.keyEnter, "choose", "esc", "cancel")
+
+	case dialogAccount:
+		if m.dlg.account == nil {
+			return "", nil, dialogRect{}
+		}
+		acct := *m.dlg.account
+		lines = append(lines, m.theme.dialogTitle.Render(fitCell(acct.Email, innerW, false)))
+		lines = append(lines, m.theme.dim.Render(fitCell(fmt.Sprintf("Slot %d %s marked signed in", acct.Number, m.glyphs.sep), innerW, false)))
+		lines = append(lines, "")
+		addWrapped("Sign out opens agy. Type /logout if you're still signed in, then /exit to come back.", m.theme.dim)
+		lines = append(lines, "")
+		renderChoices(m.dialogChoices())
+		hintLine = renderHint(m.glyphs.keyEnter, "choose", "esc", "cancel")
+
+	case dialogCleanup:
+		lines = append(lines, m.theme.dialogTitle.Render("Delete old tokens?"))
+		lines = append(lines, "")
+		addWrapped("An older version of Tori saved these. They're no longer used. Account names are kept.", m.theme.text)
+		lines = append(lines, "")
+		const maxFiles = 6
+		for i, f := range m.dlg.files {
+			if i == maxFiles {
+				lines = append(lines, m.theme.dim.Render(fmt.Sprintf("  and %d more", len(m.dlg.files)-maxFiles)))
+				break
+			}
+			if rel, err := filepath.Rel(m.env.Root, f); err == nil {
+				f = filepath.ToSlash(rel)
+			}
+			lines = append(lines, m.theme.dim.Render("  "+ansi.Truncate(f, innerW-2, m.glyphs.ellipsis)))
+		}
+		lines = append(lines, "")
+		renderChoices(m.dialogChoices())
+		hintLine = renderHint(m.glyphs.keyEnter, "choose", "esc", "cancel")
+
 	case dialogRemove:
 		if m.dlg.account == nil {
 			return "", nil, dialogRect{}
 		}
 		acct := *m.dlg.account
 		switch {
-		case !acct.Active:
+		case !m.dlg.removingInUse():
 			lines = append(lines, m.theme.dialogTitle.Render("Remove account?"))
 			lines = append(lines, "")
 			lines = append(lines, m.theme.text.Render(fitCell(acct.Email, innerW, false)))
@@ -342,6 +461,9 @@ func (m Model) buildDialog() (string, []dialogHit, dialogRect) {
 			{"b", "Rotate all tools"},
 			{"r", "Refresh usage now"},
 			{"q", "Quit"},
+		}
+		if m.legacyProvider() != nil {
+			items = append(items, struct{ k, d string }{"x", "Delete old tokens"})
 		}
 		for _, it := range items {
 			lines = append(lines, m.theme.key.Render(fitCell(it.k, 12, false))+m.theme.dim.Render(it.d))

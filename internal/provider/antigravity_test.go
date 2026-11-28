@@ -1,12 +1,14 @@
 package provider
 
 import (
-	"database/sql"
-	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -17,8 +19,10 @@ import (
 )
 
 type memKeyring struct {
-	mu    sync.Mutex
-	items map[string]string
+	mu     sync.Mutex
+	items  map[string]string
+	gets   int
+	writes int
 }
 
 func newMemKeyring() *memKeyring {
@@ -28,6 +32,7 @@ func newMemKeyring() *memKeyring {
 func (k *memKeyring) Get(service, user string) (string, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.gets++
 	v, ok := k.items[service+"\x00"+user]
 	if !ok {
 		return "", errors.New("not found")
@@ -38,6 +43,7 @@ func (k *memKeyring) Get(service, user string) (string, error) {
 func (k *memKeyring) Set(service, user, secret string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.writes++
 	k.items[service+"\x00"+user] = secret
 	return nil
 }
@@ -45,562 +51,415 @@ func (k *memKeyring) Set(service, user, secret string) error {
 func (k *memKeyring) Delete(service, user string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.writes++
 	delete(k.items, service+"\x00"+user)
 	return nil
 }
 
-func seedStateDB(t *testing.T, dbPath, access, refresh string, expiry int64, email, name string, extra map[string]string) {
+type agyFixture struct {
+	env     *Env
+	envMap  map[string]string
+	keyring *memKeyring
+	bin     string
+	ran     [][]string
+	runErr  error
+	clock   time.Time
+}
+
+// newAgyFixture returns an env with agy installed and a recording command runner.
+func newAgyFixture(t *testing.T, rt http.RoundTripper) *agyFixture {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+	env, envMap := newTestEnv(t, rt)
+	f := &agyFixture{env: env, envMap: envMap, keyring: newMemKeyring(), clock: env.now()}
+	f.bin = filepath.Join(env.Home, ".local", "bin", "agy")
+	if err := store.WriteBytesAtomic(f.bin, []byte("stub"), 0o700, false); err != nil {
 		t.Fatal(err)
 	}
-	conn, err := sql.Open("sqlite", dbPath)
+	env.Keyring = f.keyring
+	env.Now = func() time.Time { return f.clock }
+	env.RunCommand = func(cmd *exec.Cmd) error {
+		f.ran = append(f.ran, cmd.Args)
+		return f.runErr
+	}
+	return f
+}
+
+func (f *agyFixture) tick() { f.clock = f.clock.Add(time.Minute) }
+
+func (f *agyFixture) current(t *testing.T) int {
+	t.Helper()
+	g := &Antigravity{}
+	accts, err := g.Slots(f.env)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	if _, err := conn.Exec(`CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)`); err != nil {
+	if cur := g.Current(f.env, accts); cur != nil {
+		return *cur
+	}
+	return 0
+}
+
+func (f *agyFixture) login(t *testing.T, name string) {
+	t.Helper()
+	f.tick()
+	if _, err := (&Antigravity{}).Login(f.env, name); err != nil {
+		t.Fatalf("login %q: %v", name, err)
+	}
+}
+
+func storedFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var out []string
+	err := filepath.WalkDir(filepath.Join(root, "antigravity"), func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			out = append(out, d.Name())
+		}
+		return err
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	upsert := func(k, v string) {
-		if _, err := conn.Exec(`INSERT INTO ItemTable (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+func TestAntigravityNotInstalled(t *testing.T) {
+	env, _ := newTestEnv(t, nil)
+	env.RunCommand = func(cmd *exec.Cmd) error {
+		t.Fatalf("unexpected command: %v", cmd.Args)
+		return nil
+	}
+	g := &Antigravity{}
+
+	st, err := g.Status(env)
+	if err != nil || st.LoggedIn || !strings.Contains(st.Message, "tori g install") {
+		t.Fatalf("unexpected status: %+v err=%v", st, err)
+	}
+	for name, run := range map[string]func() error{
+		"login":  func() error { _, err := g.Login(env, "work"); return err },
+		"logout": func() error { _, err := g.Logout(env); return err },
+		"add":    func() error { _, err := g.Add(env, []string{"work"}); return err },
+	} {
+		if err := run(); err == nil || !strings.Contains(err.Error(), "tori g install") {
+			t.Fatalf("%s: expected install hint, got %v", name, err)
+		}
+	}
+	if slots, _ := g.Slots(env); len(slots) != 0 {
+		t.Fatalf("expected no accounts saved, got %+v", slots)
+	}
+}
+
+func TestAntigravityInstallRunsOfficialInstaller(t *testing.T) {
+	cases := []struct {
+		goos string
+		bin  []string
+		want []string
+	}{
+		{"linux", []string{".local", "bin", "agy"}, []string{"bash", "-c", "set -o pipefail; curl -fsSL https://antigravity.google/cli/install.sh | bash"}},
+		{"windows", []string{"AppData", "Local", "agy", "bin", "agy.exe"}, []string{"powershell", "-NoProfile", "-Command", "irm https://antigravity.google/cli/install.ps1 | iex"}},
+	}
+	for _, tc := range cases {
+		env, _ := newTestEnv(t, nil)
+		env.GOOS = tc.goos
+		var ran [][]string
+		env.RunCommand = func(cmd *exec.Cmd) error {
+			ran = append(ran, cmd.Args)
+			return store.WriteBytesAtomic(filepath.Join(append([]string{env.Home}, tc.bin...)...), []byte("stub"), 0o700, false)
+		}
+		g := &Antigravity{}
+		if _, err := g.Install(env); err != nil {
+			t.Fatalf("%s install: %v", tc.goos, err)
+		}
+		if len(ran) != 1 || !reflect.DeepEqual(ran[0], tc.want) {
+			t.Fatalf("%s ran %q, want %q", tc.goos, ran, tc.want)
+		}
+		// A second install finds agy and runs nothing.
+		out, err := g.Install(env)
+		if err != nil || len(ran) != 1 || !strings.Contains(out[0], "already installed") {
+			t.Fatalf("%s reinstall: out=%v ran=%d err=%v", tc.goos, out, len(ran), err)
+		}
+	}
+}
+
+func TestAntigravityLoginSwitchLogoutKeepNamesOnly(t *testing.T) {
+	f := newAgyFixture(t, nil)
+	g := &Antigravity{}
+	// A login belonging to agy: Tori must never write or delete it.
+	f.keyring.items[agyKeyringService+"\x00"+agyKeyringUser] = `{"token":{"access_token":"a","refresh_token":"r"}}`
+
+	f.login(t, "work")
+	f.login(t, "personal")
+	if want := []string{f.bin, "acp", "--login"}; !reflect.DeepEqual(f.ran[0], want) {
+		t.Fatalf("login ran %q, want %q", f.ran[0], want)
+	}
+	if cur := f.current(t); cur != 2 {
+		t.Fatalf("current = %d, want 2", cur)
+	}
+
+	// Rotating without naming an account is refused.
+	if _, err := Switch(f.env, g, ""); err == nil || !strings.Contains(err.Error(), "choose the account") {
+		t.Fatalf("expected explicit-account error, got %v", err)
+	}
+	// Switching to the marked account does not start a sign-in.
+	n := len(f.ran)
+	out, err := Switch(f.env, g, "personal")
+	if err != nil || len(f.ran) != n || !strings.Contains(strings.Join(out, "\n"), "tori g login personal") {
+		t.Fatalf("switch to current: out=%v ran=%d err=%v", out, len(f.ran), err)
+	}
+	// A cancelled sign-in leaves the marked account unchanged.
+	f.tick()
+	f.runErr = errors.New("exit status 1")
+	if _, err := Switch(f.env, g, "work"); err == nil || !strings.Contains(err.Error(), "didn't finish") {
+		t.Fatalf("expected sign-in failure, got %v", err)
+	}
+	if _, err := g.Login(f.env, "third"); err == nil {
+		t.Fatal("expected failed login")
+	}
+	if slots, _ := g.Slots(f.env); len(slots) != 2 || f.current(t) != 2 {
+		t.Fatalf("failed sign-in changed accounts: slots=%d current=%d", len(slots), f.current(t))
+	}
+	f.runErr = nil
+	f.tick()
+	if _, err := Switch(f.env, g, "work"); err != nil || f.current(t) != 1 {
+		t.Fatalf("switch: current=%d err=%v", f.current(t), err)
+	}
+	// Signing in again by name reuses the slot.
+	f.login(t, "personal")
+	if slots, _ := g.Slots(f.env); len(slots) != 2 || f.current(t) != 2 {
+		t.Fatalf("relogin: slots=%d current=%d", len(slots), f.current(t))
+	}
+
+	// The marker follows its account when slots are renumbered.
+	slots, _ := g.Slots(f.env)
+	if _, err := Remove(f.env, g, slots[0]); err != nil {
+		t.Fatal(err)
+	}
+	if cur := f.current(t); cur != 1 {
+		t.Fatalf("current after renumbering = %d, want 1", cur)
+	}
+
+	if _, err := g.Logout(f.env); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{f.bin, "-i", "/logout"}; !reflect.DeepEqual(f.ran[len(f.ran)-1], want) {
+		t.Fatalf("logout ran %q, want %q", f.ran[len(f.ran)-1], want)
+	}
+	if cur := f.current(t); cur != 0 {
+		t.Fatalf("expected no marked account after logout, got %d", cur)
+	}
+
+	if got, want := storedFiles(t, f.env.Root), []string{"account.json", "meta.json"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Tori stored %v, want only %v", got, want)
+	}
+	if f.keyring.gets != 0 || f.keyring.writes != 0 {
+		t.Fatalf("account commands touched the keyring: gets=%d writes=%d", f.keyring.gets, f.keyring.writes)
+	}
+}
+
+func TestAntigravitySignInExplainsHowToCancel(t *testing.T) {
+	for goos, want := range map[string]string{"linux": "Press Ctrl+D to cancel.", "windows": "Press Ctrl+Z, then Enter, to cancel."} {
+		f := newAgyFixture(t, nil)
+		var out strings.Builder
+		f.env.GOOS = goos
+		f.env.Stdout = &out
+		f.envMap["TORI_AGY_BIN"] = f.bin
+		f.login(t, "work")
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("%s: missing %q in %q", goos, want, out.String())
+		}
+	}
+}
+
+func TestAntigravityAddNamesWithoutSigningIn(t *testing.T) {
+	f := newAgyFixture(t, nil)
+	g := &Antigravity{}
+
+	if _, err := g.Add(f.env, nil); err == nil || !strings.Contains(err.Error(), "tori g add <name>") {
+		t.Fatalf("expected name requirement, got %v", err)
+	}
+	if _, err := g.Login(f.env, "--oops"); err == nil || len(f.ran) != 0 {
+		t.Fatalf("expected an option to be rejected before sign-in, err=%v ran=%q", err, f.ran)
+	}
+	if _, err := g.Add(f.env, []string{"7"}); err == nil {
+		t.Fatal("expected unknown slot number to be rejected")
+	}
+	f.tick()
+	if _, err := g.Add(f.env, []string{"work"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.ran) != 0 || f.current(t) != 1 {
+		t.Fatalf("add ran %q, current=%d", f.ran, f.current(t))
+	}
+
+	// An unnamed login leaves no account marked.
+	f.login(t, "")
+	if f.current(t) != 0 {
+		t.Fatalf("expected no marked account, got %d", f.current(t))
+	}
+}
+
+func TestAntigravityLegacyTokenCleanup(t *testing.T) {
+	f := newAgyFixture(t, nil)
+	g := &Antigravity{}
+	dir1 := store.SlotDir(f.env.Root, g.Key(), 1)
+	dir2 := store.SlotDir(f.env.Root, g.Key(), 2)
+	for path, v := range map[string]any{
+		filepath.Join(dir1, "auth.json"):      map[string]any{"refreshToken": "rt"},
+		filepath.Join(dir1, "access.json"):    map[string]any{"accessToken": "at"},
+		filepath.Join(dir1, "meta.json"):      store.Meta{Email: "a@example.com", Alias: "work"},
+		filepath.Join(dir2, "acp_token.json"): map[string]any{"refresh_token": "rt"},
+		filepath.Join(dir2, "meta.json"):      store.Meta{Alias: "old"},
+	} {
+		if err := store.WriteJSONAtomic(path, v, 0o600, false); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if refresh != "" {
-		upsert(agyKeyUnifiedOAuth, createUnifiedOAuthToken(access, refresh, expiry))
+
+	if slots, _ := g.Slots(f.env); len(slots) != 2 || f.current(t) != 0 {
+		t.Fatalf("old slots: %d, current=%d", len(slots), f.current(t))
 	}
-	if email != "" || name != "" {
-		raw, _ := json.Marshal(map[string]any{
-			"name":   name,
-			"email":  email,
-			"apiKey": access,
-		})
-		upsert(agyKeyAuthStatus, string(raw))
+	if files := g.LegacyTokenFiles(f.env); len(files) != 3 {
+		t.Fatalf("legacy files = %v", files)
 	}
-	for k, v := range extra {
-		upsert(k, v)
+	n, err := g.DeleteLegacyTokens(f.env)
+	if err != nil || n != 3 {
+		t.Fatalf("cleanup: n=%d err=%v", n, err)
+	}
+	slots, _ := g.Slots(f.env)
+	if len(slots) != 2 || slots[0].Meta.Email != "a@example.com" || slots[1].Meta.Alias != "old" {
+		t.Fatalf("accounts lost by cleanup: %+v", slots)
+	}
+	if got, want := storedFiles(t, f.env.Root), []string{"account.json", "meta.json"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("files after cleanup %v, want %v", got, want)
 	}
 }
 
-func readStateDBKey(t *testing.T, dbPath, key string) (string, bool) {
-	t.Helper()
-	conn, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	var val string
-	err = conn.QueryRow(`SELECT value FROM ItemTable WHERE key = ?`, key).Scan(&val)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	return val, true
-}
-
-func TestAntigravityProtoRoundTrip(t *testing.T) {
-	enc := createUnifiedOAuthToken("ya29.access-token-123", "1//0refresh-token-456", 1795584026)
-	at, rt, exp, err := extractOAuthFromUnified(enc)
-	if err != nil {
-		t.Fatalf("extractOAuthFromUnified failed: %v", err)
-	}
-	if at != "ya29.access-token-123" || rt != "1//0refresh-token-456" || exp != 1795584026 {
-		t.Fatalf("round-trip mismatch: at=%q rt=%q exp=%d", at, rt, exp)
-	}
-}
-
-func TestAntigravityNotInstalledAndLoggedOutMessages(t *testing.T) {
-	env, _ := newTestEnv(t, nil)
-	g := &Antigravity{}
-
-	// Nothing installed on disk or keyring.
-	st, err := g.Status(env)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.LoggedIn || !strings.Contains(st.Message, "not found") || !strings.Contains(st.Message, "Desktop/IDE") || !strings.Contains(st.Message, "agy") {
-		t.Fatalf("unexpected not-installed status: %+v", st)
-	}
-	if _, err := g.Add(env, nil); err == nil || !strings.Contains(err.Error(), "no Antigravity installation found") {
-		t.Fatalf("expected not-installed Add error, got: %v", err)
-	}
-
-	// Create an empty Antigravity Desktop state.vscdb (installed, not logged in).
-	dbPath := filepath.Join(env.Home, ".config", "Antigravity", "User", "globalStorage", "state.vscdb")
-	seedStateDB(t, dbPath, "", "", 0, "", "", map[string]string{"workbench.colorTheme": "Dark+"})
-
-	st, err = g.Status(env)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.LoggedIn || st.Message != "Not logged in to Antigravity." {
-		t.Fatalf("unexpected logged-out status: %+v", st)
-	}
-	if _, err := g.Add(env, nil); err == nil || !strings.Contains(err.Error(), "no Antigravity login found") {
-		t.Fatalf("expected logged-out Add error, got: %v", err)
-	}
-}
-
-func TestAntigravityDesktopStateDBLifecycleWithoutT3(t *testing.T) {
-	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+func agyQuotaTransport(t *testing.T, email *string, calls *int) http.RoundTripper {
+	var mu sync.Mutex
+	return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		*calls++
+		if got := req.Header.Get("Authorization"); got != "Bearer live-access" {
+			t.Errorf("unexpected authorization %q", got)
+		}
 		switch req.URL.String() {
-		case agyGoogleTokenURL:
-			return jsonResponse(200, map[string]any{"access_token": "refreshed-at", "expires_in": 3600}), nil
+		case agyUserinfoURL:
+			return jsonResponse(200, map[string]any{"email": *email}), nil
 		case agyDailyEndpoint + "/v1internal:retrieveUserQuotaSummary":
+			return jsonResponse(200, map[string]any{}), nil // empty: try the next endpoint
+		case agyProdEndpoint + "/v1internal:retrieveUserQuotaSummary":
+			return jsonResponse(500, map[string]any{"error": "boom"}), nil
+		case agyDailyEndpoint + "/v1internal:fetchAvailableModels":
 			return jsonResponse(200, map[string]any{
-				"groups": []any{
-					map[string]any{
-						"buckets": []any{
-							map[string]any{"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.8, "resetTime": "2026-11-26T17:00:00Z"},
-							map[string]any{"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.6, "resetTime": "2026-12-01T00:00:00Z"},
-						},
+				"models": map[string]any{
+					"gemini-2.5-pro": map[string]any{
+						"modelProvider":   "MODEL_PROVIDER_GOOGLE",
+						"quotaInfo":       map[string]any{"remainingFraction": 0.75},
+						"weeklyQuotaInfo": map[string]any{"remainingFraction": 0.4},
 					},
 				},
 			}), nil
 		default:
-			t.Fatalf("unexpected URL: %s", req.URL.String())
-			return nil, nil
+			t.Errorf("unexpected URL: %s", req.URL.String())
+			return nil, errors.New("unexpected")
 		}
 	})
-	env, envMap := newTestEnv(t, rt)
+}
+
+func agyTokenJSON(access string, expiry time.Time) string {
+	return `{"token":{"access_token":"` + access + `","refresh_token":"never-used","expiry":"` +
+		expiry.Format(time.RFC3339Nano) + `"},"auth_method":"consumer"}`
+}
+
+func TestAntigravityQuotaOnlyForSignedInAccount(t *testing.T) {
+	email := "work@example.com"
+	calls := 0
+	f := newAgyFixture(t, agyQuotaTransport(t, &email, &calls))
 	g := &Antigravity{}
+	key := agyKeyringService + "\x00" + agyKeyringUser
+	f.keyring.items[key] = agyTokenJSON("live-access", f.clock.Add(2*time.Hour))
+	f.login(t, "work")
+	f.login(t, "personal")
+	f.tick()
+	if _, err := Switch(f.env, g, "work"); err != nil {
+		t.Fatal(err)
+	}
 
-	dbPath := filepath.Join(env.Home, ".config", "Antigravity", "User", "globalStorage", "state.vscdb")
-	freshExp := env.now().Unix() + 3600
-	expiredExp := env.now().Unix() - 100
+	// Meters are off by default: no keyring read and no network.
+	if _, _, err := Entries(f.env, g, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 || f.keyring.gets != 0 {
+		t.Fatalf("meters off: calls=%d keyring gets=%d", calls, f.keyring.gets)
+	}
 
-	// Account 1 (fresh access token, no T3 Code at all).
-	seedStateDB(t, dbPath, "ya29.alice", "1//0rt-alice", freshExp, "alice@example.com", "Alice", map[string]string{
-		"workbench.colorTheme": "Default Dark+",
-		agyKeyLegacyAuth:       "stale-legacy",
-	})
-
-	st, err := g.Status(env)
+	if err := config.SetUsage(f.env.Root, []string{"antigravity"}, true); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := Entries(f.env, g, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st.LoggedIn || st.DisplayName != "alice@example.com" || st.ManagedSlot != nil {
-		t.Fatalf("unexpected unsaved desktop status: %+v", st)
+	u := entries[0].Usage
+	if u == nil || len(u.Windows) != 2 || u.Windows[0].Pct != 25 || u.Windows[1].Pct != 60 {
+		t.Fatalf("signed-in account usage: %+v", u)
 	}
-	out, err := g.Add(env, []string{"Work"})
+	if entries[0].Email != "work@example.com" {
+		t.Fatalf("expected learned email, got %q", entries[0].Email)
+	}
+	if entries[1].Usage != nil {
+		t.Fatalf("other account must not be read: %+v", entries[1].Usage)
+	}
+	if f.keyring.writes != 0 {
+		t.Fatalf("quota wrote to the keyring %d times", f.keyring.writes)
+	}
+
+	// A different account signed in directly in agy must not be shown as this one.
+	email = "someone-else@example.com"
+	f.clock = f.clock.Add(10 * time.Minute)
+	entries, _, err = Entries(f.env, g, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out[0], "Added slot 1: alice@example.com [Work]") {
-		t.Fatalf("unexpected Add 1 output: %v", out)
-	}
-
-	// Account 2 (expired access token, will need OAuth refresh when fetching quota).
-	seedStateDB(t, dbPath, "ya29.bob-expired", "1//0rt-bob", expiredExp, "bob@example.com", "Bob", nil)
-	out, err = g.Add(env, []string{"Personal"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out[0], "Added slot 2: bob@example.com [Personal]") {
-		t.Fatalf("unexpected Add 2 output: %v", out)
-	}
-
-	// Running process guard prevents mutating state.vscdb while Antigravity Desktop is open.
-	env.ProcessRunning = func(surface string) bool { return surface == agySurfaceDesktop }
-	if _, err := Switch(env, g, "1"); err == nil || !strings.Contains(err.Error(), "Antigravity Desktop is running") {
-		t.Fatalf("expected running-app error, got: %v", err)
-	}
-	// Verify DB was NOT modified when blocked.
-	if raw, ok := readStateDBKey(t, dbPath, agyKeyUnifiedOAuth); !ok {
-		t.Fatal("missing oauth key")
-	} else if _, rtVal, _, err := extractOAuthFromUnified(raw); err != nil || rtVal != "1//0rt-bob" {
-		t.Fatalf("expected DB untouched on bob, got rt=%q err=%v", rtVal, err)
-	}
-
-	// Close Desktop -> switch to slot 1 succeeds and preserves unrelated settings.
-	env.ProcessRunning = func(string) bool { return false }
-	swOut, err := Switch(env, g, "1")
-	if err != nil {
-		t.Fatalf("Switch to slot 1 failed: %v", err)
-	}
-	if !strings.Contains(strings.Join(swOut, "\n"), "Open Antigravity Desktop") {
-		t.Fatalf("expected desktop restart hint, got: %v", swOut)
-	}
-	if raw, ok := readStateDBKey(t, dbPath, agyKeyUnifiedOAuth); !ok {
-		t.Fatal("missing oauth key after switch")
-	} else if _, rtVal, _, err := extractOAuthFromUnified(raw); err != nil || rtVal != "1//0rt-alice" {
-		t.Fatalf("expected alice token in DB, got rt=%q err=%v", rtVal, err)
-	}
-	if theme, ok := readStateDBKey(t, dbPath, "workbench.colorTheme"); !ok || theme != "Default Dark+" {
-		t.Fatalf("expected unrelated IDE setting preserved, got %q ok=%v", theme, ok)
-	}
-	if _, hasLegacy := readStateDBKey(t, dbPath, agyKeyLegacyAuth); hasLegacy {
-		t.Fatal("expected google.antigravity deleted on switch")
-	}
-	if onboard, ok := readStateDBKey(t, dbPath, agyKeyOnboarding); !ok || onboard != "true" {
-		t.Fatalf("expected antigravityOnboarding=true, got %q ok=%v", onboard, ok)
-	}
-
-	// Quota fetch: slot 1 uses fresh embedded access token; slot 2 refreshes using client credentials.
-	envMap["TORI_AGY_CLIENT_ID"] = "test-cid"
-	envMap["TORI_AGY_CLIENT_SECRET"] = "test-csec"
-	if err := config.SetUsage(env.Root, []string{"antigravity"}, true); err != nil {
-		t.Fatal(err)
-	}
-	entries, cur, err := Entries(env, g, true, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cur == nil || *cur != 1 || len(entries) != 2 {
-		t.Fatalf("unexpected entries: cur=%v len=%d", cur, len(entries))
-	}
-	for i, e := range entries {
-		if e.Usage == nil || len(e.Usage.Windows) != 2 || e.Usage.Windows[0].Pct != 20.0 || e.Usage.Windows[1].Pct != 40.0 {
-			t.Fatalf("slot %d unexpected usage: %+v", i+1, e.Usage)
-		}
-	}
-
-	// ClearLive removes auth keys while keeping unrelated settings, and restore brings login back.
-	restore, err := g.ClearLive(env)
-	if err != nil {
-		t.Fatalf("ClearLive failed: %v", err)
-	}
-	if st, _ := g.Status(env); st.LoggedIn {
-		t.Fatalf("expected logged out after ClearLive, got %+v", st)
-	}
-	if theme, ok := readStateDBKey(t, dbPath, "workbench.colorTheme"); !ok || theme != "Default Dark+" {
-		t.Fatalf("expected theme preserved during ClearLive, got %q ok=%v", theme, ok)
-	}
-	if err := restore(); err != nil {
-		t.Fatalf("restore failed: %v", err)
-	}
-	if st, _ := g.Status(env); !st.LoggedIn || st.ManagedSlot == nil || *st.ManagedSlot != 1 {
-		t.Fatalf("expected restored to slot 1, got %+v", st)
+	u = entries[0].Usage
+	if u == nil || u.Error == nil || *u.Error != "another account is signed in" || entries[0].Email != "work@example.com" {
+		t.Fatalf("mismatched account: %+v email=%q", u, entries[0].Email)
 	}
 }
 
-func TestAntigravityIDEStateDBAndDarwinPaths(t *testing.T) {
-	env, _ := newTestEnv(t, nil)
-	env.GOOS = "darwin"
+func TestAntigravityQuotaNeverRenewsExpiredLogin(t *testing.T) {
+	calls := 0
+	email := "work@example.com"
+	f := newAgyFixture(t, agyQuotaTransport(t, &email, &calls))
 	g := &Antigravity{}
-
-	dbPath := filepath.Join(env.Home, "Library", "Application Support", "Antigravity IDE", "User", "globalStorage", "state.vscdb")
-	exp := env.now().Unix() + 3600
-	seedStateDB(t, dbPath, "ya29.ide1", "1//0rt-ide1", exp, "ide1@example.com", "IDE One", nil)
-	if _, err := g.Add(env, []string{"IDE1"}); err != nil {
+	// No keyring entry: agy's token file is the fallback.
+	tokenFile := filepath.Join(f.env.Home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+	if err := store.WriteBytesAtomic(tokenFile, []byte(agyTokenJSON("live-access", f.clock.Add(-time.Hour))), 0o600, false); err != nil {
 		t.Fatal(err)
 	}
-	seedStateDB(t, dbPath, "ya29.ide2", "1//0rt-ide2", exp, "ide2@example.com", "IDE Two", nil)
-	if _, err := g.Add(env, []string{"IDE2"}); err != nil {
+	f.login(t, "work")
+	if err := config.SetUsage(f.env.Root, []string{"antigravity"}, true); err != nil {
 		t.Fatal(err)
 	}
-
-	env.ProcessRunning = func(surface string) bool { return surface == agySurfaceIDE }
-	if _, err := Switch(env, g, "1"); err == nil || !strings.Contains(err.Error(), "Antigravity IDE is running") {
-		t.Fatalf("expected IDE running error, got: %v", err)
-	}
-
-	env.ProcessRunning = func(string) bool { return false }
-	out, err := Switch(env, g, "1")
+	entries, _, err := Entries(f.env, g, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(out, "\n"), "Open Antigravity IDE") {
-		t.Fatalf("expected IDE restart hint, got: %v", out)
+	u := entries[0].Usage
+	if u == nil || u.Error == nil || *u.Error != g.PermError() {
+		t.Fatalf("expected renew hint, got %+v", u)
 	}
-	slots, _ := g.Slots(env)
-	if cur := g.Current(env, slots); cur == nil || *cur != 1 {
-		t.Fatalf("expected active slot 1, got %v", cur)
+	if calls != 0 {
+		t.Fatalf("expired login must not reach the network, calls=%d", calls)
 	}
-}
 
-func TestAntigravityCLIKeyringAndFileFallbackLifecycle(t *testing.T) {
-	env, _ := newTestEnv(t, nil)
-	kr := newMemKeyring()
-	env.Keyring = kr
-	g := &Antigravity{}
-
-	cliDir := filepath.Join(env.Home, ".gemini", "antigravity-cli")
-	cliTokenFile := filepath.Join(cliDir, "antigravity-oauth-token")
-	cliSettingsFile := filepath.Join(cliDir, "settings.json")
-	desktop2TokenFile := filepath.Join(env.Home, ".gemini", "jetski-standalone-oauth-token")
-	if err := os.MkdirAll(filepath.Join(env.Home, ".gemini", "antigravity"), 0o700); err != nil {
+	if err := os.WriteFile(tokenFile, []byte(agyTokenJSON("live-access", f.clock.Add(time.Hour))), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_ = store.WriteJSONAtomic(cliSettingsFile, map[string]any{"theme": "dark"}, 0o600, false)
-
-	// Account 1: consumer account in keyring (email comes from id_token JWT).
-	consumerDoc, _ := json.Marshal(map[string]any{
-		"token": map[string]any{
-			"access_token":  "ya29.cli-consumer",
-			"token_type":    "Bearer",
-			"refresh_token": "1//0rt-cli-1",
-			"expiry":        env.now().Add(time.Hour).Format(time.RFC3339Nano),
-		},
-		"auth_method": "consumer",
-		"id_token":    makeJWT(map[string]any{"email": "cli-consumer@example.com", "sub": "sub-1"}),
-	})
-	_ = kr.Set(agyKeyringService, agyKeyringUser, string(consumerDoc))
-
-	if out, err := g.Add(env, []string{"Personal"}); err != nil {
-		t.Fatal(err)
-	} else if !strings.Contains(out[0], "cli-consumer@example.com [Personal]") {
-		t.Fatalf("unexpected CLI add 1 output: %v", out)
-	}
-
-	// Account 2: GCP account in keyring.
-	gcpDoc, _ := json.Marshal(map[string]any{
-		"token": map[string]any{
-			"access_token":  "ya29.cli-gcp",
-			"token_type":    "Bearer",
-			"refresh_token": "1//0rt-cli-2",
-			"expiry":        env.now().Add(time.Hour).Format(time.RFC3339Nano),
-		},
-		"auth_method":    "gcp",
-		"project_id":     "my-gcp-proj",
-		"region":         "us",
-		"id_token_email": "cli-gcp@example.com",
-	})
-	_ = kr.Set(agyKeyringService, agyKeyringUser, string(gcpDoc))
-
-	if out, err := g.Add(env, []string{"WorkGCP"}); err != nil {
-		t.Fatal(err)
-	} else if !strings.Contains(out[0], "cli-gcp@example.com [WorkGCP]") {
-		t.Fatalf("unexpected CLI add 2 output: %v", out)
-	}
-
-	// Switch to slot 1 (consumer): writes keyring + CLI fallback + Desktop 2.x mirror, keeps theme, no gcp block.
-	if _, err := Switch(env, g, "1"); err != nil {
-		t.Fatal(err)
-	}
-	gotKR, err := kr.Get(agyKeyringService, agyKeyringUser)
-	if err != nil || !strings.Contains(gotKR, "1//0rt-cli-1") {
-		t.Fatalf("expected consumer token in keyring, got %q err=%v", gotKR, err)
-	}
-	if b, err := os.ReadFile(cliTokenFile); err != nil || !strings.Contains(string(b), "1//0rt-cli-1") {
-		t.Fatalf("expected CLI fallback file mirrored, got %q err=%v", string(b), err)
-	}
-	if b, err := os.ReadFile(desktop2TokenFile); err != nil || !strings.Contains(string(b), "1//0rt-cli-1") {
-		t.Fatalf("expected Desktop 2.x fallback file mirrored, got %q err=%v", string(b), err)
-	}
-
-	// Switch to slot 2 (GCP): adds gcp block to settings.json while preserving theme.
-	if _, err := Switch(env, g, "2"); err != nil {
-		t.Fatal(err)
-	}
-	settings := store.ReadJSONMap(cliSettingsFile)
-	if settings["theme"] != "dark" || getString(getMap(settings, "gcp"), "project") != "my-gcp-proj" || getString(getMap(settings, "gcp"), "location") != "us" {
-		t.Fatalf("expected gcp settings synced and theme preserved, got %+v", settings)
-	}
-
-	// Switch back to consumer (with keyring disabled -> file-only fallback still works!): removes gcp block.
-	env.Keyring = nil
-	if _, err := Switch(env, g, "1"); err != nil {
-		t.Fatalf("file-only fallback switch failed: %v", err)
-	}
-	settings = store.ReadJSONMap(cliSettingsFile)
-	if settings["theme"] != "dark" || settings["gcp"] != nil {
-		t.Fatalf("expected gcp block removed on consumer switch, got %+v", settings)
-	}
-}
-
-func TestAntigravityT3OAuthTokenAndLegacySlotCompat(t *testing.T) {
-	env, _ := newTestEnv(t, nil)
-	g := &Antigravity{}
-
-	// 1. Legacy v0.1/v0.2 slot containing ONLY acp_token.json (no auth.json).
-	legacyDir := store.SlotDir(env.Root, g.Key(), 1)
-	_ = store.WriteJSONAtomic(filepath.Join(legacyDir, agyLegacyFile), map[string]any{
-		"client_id":     "cid",
-		"client_secret": "csec",
-		"refresh_token": "1//0rt-legacy",
-		"project_id":    "proj-legacy",
-	}, 0o600, false)
-	_ = store.WriteJSONAtomic(filepath.Join(legacyDir, "meta.json"), store.Meta{
-		Email: "legacy@example.com",
-		Alias: "Legacy",
-	}, 0o600, false)
-
-	// 2. Newer T3 runtime using antigravity-oauth-token under ~/.t3/.../antigravity-acp/.
-	t3Dir := filepath.Join(env.Home, ".t3", "userdata", "providers", "antigravity", "abc123", "antigravity-acp")
-	t3OAuthPath := filepath.Join(t3Dir, "antigravity-oauth-token")
-	_ = store.WriteJSONAtomic(t3OAuthPath, map[string]any{
-		"token": map[string]any{
-			"access_token":  "ya29.t3-new",
-			"token_type":    "Bearer",
-			"refresh_token": "1//0rt-t3-new",
-			"expiry":        env.now().Add(time.Hour).Format(time.RFC3339Nano),
-		},
-		"auth_method": "consumer",
-		"id_token":    makeJWT(map[string]any{"email": "t3new@example.com"}),
-	}, 0o600, false)
-
-	slots, err := g.Slots(env)
-	if err != nil || len(slots) != 1 || slots[0].Meta.Email != "legacy@example.com" {
-		t.Fatalf("expected legacy slot loaded, got %+v err=%v", slots, err)
-	}
-
-	// Add the new T3 antigravity-oauth-token as slot 2.
-	if out, err := g.Add(env, []string{"NewT3"}); err != nil {
-		t.Fatal(err)
-	} else if !strings.Contains(out[0], "Added slot 2: t3new@example.com [NewT3]") {
-		t.Fatalf("unexpected T3 oauth add output: %v", out)
-	}
-
-	// Switch to legacy slot 1 -> writes acp_token.json in T3 dir.
-	if _, err := Switch(env, g, "1"); err != nil {
-		t.Fatalf("switch to legacy slot 1 failed: %v", err)
-	}
-	if b, err := os.ReadFile(filepath.Join(t3Dir, "acp_token.json")); err != nil || !strings.Contains(string(b), "1//0rt-legacy") {
-		t.Fatalf("expected legacy acp_token.json written, got %q err=%v", string(b), err)
-	}
-
-	// Remove slot 1 -> slot 2 compacts cleanly to slot 1!
-	slots, _ = g.Slots(env)
-	if _, err := Remove(env, g, slots[0]); err != nil {
-		t.Fatalf("Remove legacy slot failed: %v", err)
-	}
-	slots, _ = g.Slots(env)
-	if len(slots) != 1 || slots[0].Number != 1 || slots[0].Meta.Email != "t3new@example.com" {
-		t.Fatalf("expected slot 2 compacted to slot 1, got %+v", slots)
-	}
-}
-
-func TestAntigravityMultiSurfaceMergeAndIsolation(t *testing.T) {
-	env, _ := newTestEnv(t, nil)
-	kr := newMemKeyring()
-	env.Keyring = kr
-	g := &Antigravity{}
-
-	dbPath := filepath.Join(env.Home, ".config", "Antigravity", "User", "globalStorage", "state.vscdb")
-	t3Path := filepath.Join(env.Home, ".t3", "userdata", "providers", "antigravity", "hash1", "antigravity-acp", "acp_token.json")
-	exp := env.now().Unix() + 3600
-
-	// Desktop signed in as alice@example.com -> saved as slot 1.
-	seedStateDB(t, dbPath, "ya29.desk-a", "1//0rt-desk-a", exp, "alice@example.com", "Alice", nil)
-	if _, err := g.Add(env, []string{"Alice"}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Now CLI also signs in as alice@example.com -> Add merges CLI into existing slot 1!
-	cliDoc, _ := json.Marshal(map[string]any{
-		"token": map[string]any{
-			"access_token":  "ya29.cli-a",
-			"token_type":    "Bearer",
-			"refresh_token": "1//0rt-cli-a",
-			"expiry":        env.now().Add(time.Hour).Format(time.RFC3339Nano),
-		},
-		"auth_method": "consumer",
-		"id_token":    makeJWT(map[string]any{"email": "alice@example.com"}),
-	})
-	_ = kr.Set(agyKeyringService, agyKeyringUser, string(cliDoc))
-	out, err := g.Add(env, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out[0], "Updated slot 1") || !strings.Contains(out[0], "Antigravity CLI") {
-		t.Fatalf("expected CLI merged into slot 1, got %v", out)
-	}
-
-	// Meanwhile T3 Code is signed in as an unrelated account (not captured in slot 1).
-	_ = store.WriteJSONAtomic(t3Path, map[string]any{"refresh_token": "1//0rt-t3-other"}, 0o600, false)
-
-	// Switch Desktop ONLY to bob@example.com (unsaved), while CLI stays on alice@example.com.
-	seedStateDB(t, dbPath, "ya29.desk-b", "1//0rt-desk-b", exp, "bob@example.com", "Bob", nil)
-	// Touch dbPath slightly newer than t3Path so Desktop is clearly the newest unsaved login.
-	future := time.Now().Add(2 * time.Second)
-	_ = os.Chtimes(dbPath, future, future)
-
-	if st, err := g.Status(env); err != nil || !st.LoggedIn || st.ManagedSlot != nil || st.DisplayName != "bob@example.com" {
-		t.Fatalf("expected unsaved bob@example.com status, got %+v err=%v", st, err)
-	}
-	if out, err := g.Add(env, []string{"Bob"}); err != nil {
-		t.Fatal(err)
-	} else if !strings.Contains(out[0], "Added slot 2: bob@example.com [Bob]") {
-		t.Fatalf("unexpected slot 2 add: %v", out)
-	}
-
-	// Switching to slot 1 switches Desktop AND CLI, and does NOT touch T3 Code!
-	if _, err := Switch(env, g, "1"); err != nil {
-		t.Fatal(err)
-	}
-	if raw, _ := readStateDBKey(t, dbPath, agyKeyUnifiedOAuth); raw == "" {
-		t.Fatal("missing desktop oauth after switch")
-	} else if _, rt, _, _ := extractOAuthFromUnified(raw); rt != "1//0rt-desk-a" {
-		t.Fatalf("expected desktop switched to alice, got %q", rt)
-	}
-	if gotKR, _ := kr.Get(agyKeyringService, agyKeyringUser); !strings.Contains(gotKR, "1//0rt-cli-a") {
-		t.Fatalf("expected CLI switched to alice, got %q", gotKR)
-	}
-	if t3Bytes, _ := os.ReadFile(t3Path); !strings.Contains(string(t3Bytes), "1//0rt-t3-other") {
-		t.Fatalf("expected T3 Code untouched by Desktop+CLI slot, got %q", string(t3Bytes))
-	}
-}
-
-func TestMatchAntigravityProcess(t *testing.T) {
-	cases := []struct {
-		cmdline string
-		surface string
-		want    bool
-	}{
-		{"/usr/lib/electron39/electron /usr/lib/antigravity/out/cli.js --app=/usr/lib/antigravity/", "desktop", true},
-		{"/usr/lib/electron39/electron /usr/lib/antigravity/out/cli.js --app=/usr/lib/antigravity/", "ide", false},
-		{"/Applications/Antigravity.app/Contents/MacOS/Antigravity", "desktop", true},
-		{"/Applications/Antigravity IDE.app/Contents/MacOS/Electron", "ide", true},
-		{"/Applications/Antigravity IDE.app/Contents/MacOS/Electron", "desktop", false},
-		{"/usr/bin/antigravity-ide", "ide", true},
-		// Must NOT false-positive on T3 Code ACP harness, CLI, or tori!
-		{"/home/user/.t3/tools/antigravity-acp/linux-x64/agy_acp_server.par --uid=", "desktop", false},
-		{"/home/user/.t3/tools/antigravity-acp/linux-x64/localharness_external", "desktop", false},
-		{"/home/user/.local/bin/agy chat", "desktop", false},
-		{"tori g switch 1", "desktop", false},
-		{"/opt/Antigravity Manager/antigravity-manager", "desktop", false},
-	}
-	for _, tc := range cases {
-		if got := matchAntigravityProcess(tc.cmdline, tc.surface); got != tc.want {
-			t.Errorf("matchAntigravityProcess(%q, %q) = %v, want %v", tc.cmdline, tc.surface, got, tc.want)
-		}
-	}
-}
-
-func TestResolveAgyWrapper(t *testing.T) {
-	dir := t.TempDir()
-	realBin := filepath.Join(dir, "agy-real")
-	if err := os.WriteFile(realBin, []byte("binary-payload"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	wrapper := filepath.Join(dir, "agy")
-	script := "#!/bin/sh\nexec \"" + realBin + "\" \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if got := resolveAgyWrapper(wrapper); got != realBin {
-		t.Fatalf("resolveAgyWrapper = %q, want %q", got, realBin)
-	}
-}
-
-func TestCollectAgyCandidatesAndDiscovery(t *testing.T) {
-	// Verify candidate extraction handles non-null-terminated binary string tables.
-	fakeID := "123456789012-" + strings.Repeat("a", 32) + agyClientIDSuffix
-	fakeSec := agyClientSecretPrefix + strings.Repeat("x", 28)
-	payload := []byte("prefix-noise" + fakeID + "TRAILING_GARBAGE" + fakeSec + "MORE_GARBAGE")
-	ids := map[string]bool{}
-	secrets := map[string]bool{}
-	collectAgyCandidates(payload, ids, secrets)
-
-	id, sec := matchAgyClientPair(ids, secrets, sha256Hex(fakeID), sha256Hex(fakeSec))
-	if id != fakeID || sec != fakeSec {
-		t.Fatalf("matchAgyClientPair failed: got id=%v sec=%v", id != "", sec != "")
-	}
-
-	// If Antigravity Desktop is installed on this host, verify hash-matched discovery works.
-	const realLS = "/usr/lib/antigravity/extensions/antigravity/bin/language_server_linux_x64"
-	if _, err := os.Stat(realLS); err == nil {
-		creds, ok := scanAgyBinaryCached(realLS)
-		if !ok || sha256Hex(creds.clientID) != agyClientIDHash {
-			t.Fatalf("expected hash-matched OAuth client from installed language_server, ok=%v", ok)
-		}
-		secHash := sha256Hex(creds.clientSecret)
-		if secHash != agyClientSecretHashV1 && secHash != agyClientSecretHashV2 {
-			t.Fatalf("unexpected OAuth secret hash from installed language_server")
-		}
+	f.clock = f.clock.Add(10 * time.Minute)
+	entries, _, err = Entries(f.env, g, true, false)
+	if err != nil || entries[0].Usage == nil || len(entries[0].Usage.Windows) != 2 {
+		t.Fatalf("token file fallback: %+v err=%v", entries[0].Usage, err)
 	}
 }
